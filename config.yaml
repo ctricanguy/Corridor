@@ -1,0 +1,136 @@
+# Corridor — methodology configuration
+# -------------------------------------
+# This file holds the WATCHLIST and the METHODOLOGY PARAMETERS. Secrets and
+# machine-specific paths live in `.env` (see .env.example), never here.
+#
+# Philosophy: start narrow, go deep. Ten names done rigorously beats a hundred
+# done shallowly. Seed universe is the focused large-cap tech/AI set below.
+
+# ---------------------------------------------------------------------------
+# Universe / watchlist
+# ---------------------------------------------------------------------------
+# `cik` is the SEC Central Index Key used for EDGAR companyfacts lookups.
+# It is filled in during Stage 1 ingestion; left null here so nothing is
+# hardcoded incorrectly. Tickers are the single source of truth for the run.
+universe:
+  - ticker: NVDA
+    name: NVIDIA Corp
+    cik: null
+  - ticker: MSFT
+    name: Microsoft Corp
+    cik: null
+  - ticker: AAPL
+    name: Apple Inc
+    cik: null
+  - ticker: GOOGL
+    name: Alphabet Inc
+    cik: null
+  - ticker: AMZN
+    name: Amazon.com Inc
+    cik: null
+  - ticker: META
+    name: Meta Platforms Inc
+    cik: null
+  - ticker: TSLA
+    name: Tesla Inc
+    cik: null
+  - ticker: AMD
+    name: Advanced Micro Devices Inc
+    cik: null
+  - ticker: AVGO
+    name: Broadcom Inc
+    cik: null
+  - ticker: MU
+    name: Micron Technology Inc
+    cik: null
+
+# ---------------------------------------------------------------------------
+# Factor 1 — Earnings (the anchor)
+# ---------------------------------------------------------------------------
+earnings:
+  # Which earnings model drives the engine. v1 = consensus passthrough.
+  # The EarningsModel interface (src/corridor/engine/earnings.py) lets you later
+  # plug in your own per-segment estimates without touching the valuation math.
+  model: consensus
+  # How many forward (unreported) quarters define the "next-4-quarter" EPS sum.
+  forward_window_quarters: 4
+
+# ---------------------------------------------------------------------------
+# Factor 2 — Valuation: forward-P/E corridor / True P/E
+# ---------------------------------------------------------------------------
+valuation:
+  corridor:
+    # Percentile bands for the historical forward-P/E distribution.
+    pctl_low: 20
+    pctl_high: 80
+    # Lookback window (calendar days) over which the distribution is computed.
+    # NOTE: real history will be far shorter than this at launch and grows as
+    # the daily job accumulates snapshots. See min_history_days.
+    lookback_days: 504
+    # Below this many days of REAL snapshot history, charts/signals are flagged
+    # as thin and must be interpreted with caution (surfaced in UI + memos).
+    min_history_days: 60
+  signals:
+    # "hard buy" when price sits in the bottom decile of its historical forward
+    # multiple AND the earnings trend is rising.
+    hard_buy_pctl: 10
+    buy_pctl: 20
+    trim_pctl: 80
+    hard_trim_pctl: 90
+  premium_term:
+    # Optional company-premium term: regress the multiple on growth/quality so a
+    # persistently-premium name isn't flagged as permanently overvalued.
+    # Kept SEPARATE from PEG on purpose — the disagreement between the two is
+    # itself signal. v1 leaves this disabled; enable in a later stage.
+    enabled: false
+
+# ---------------------------------------------------------------------------
+# Factor 2b — Growth-adjusted valuation (forward PEG)
+# ---------------------------------------------------------------------------
+peg:
+  # The growth basis is the whole ballgame for PEG. It is made EXPLICIT here and
+  # LOGGED on every calculation. Options:
+  #   ntm_vs_ltm : next-twelve-month EPS vs last-twelve-month EPS (default)
+  #   fwd_cagr   : multi-year forward EPS CAGR (uses cagr_years out-year estimates)
+  growth_basis: ntm_vs_ltm
+  cagr_years: 3
+  # Context-only heuristics (NOT hard triggers). The actual signal always defers
+  # to the corridor + earnings trend.
+  cheap_threshold: 1.0
+  rich_threshold: 2.0
+  # Guardrail: when the forward growth rate falls below this (near-zero or
+  # negative), PEG division blows up / sign-flips. Suppress the PEG signal and
+  # fall back to the corridor.
+  min_growth_rate: 0.02
+
+# ---------------------------------------------------------------------------
+# Factor 3 — Sentiment / base-rate overlay
+# ---------------------------------------------------------------------------
+overlay:
+  rsi_period: 14
+  ma_periods: [50, 200]
+  streak:
+    # Winning-streak base-rate study: distribution of consecutive weekly-gain
+    # streak lengths and forward returns conditioned on streak length.
+    frequency: weekly
+    lookback_years: 10
+  earnings_calendar:
+    # Days around a report to raise pre/post-earnings positioning flags.
+    pre_window_days: 7
+    post_window_days: 2
+  # Future hook only — do not build yet.
+  finbert_sentiment:
+    enabled: false
+
+# ---------------------------------------------------------------------------
+# Data sources (swappable interface — see src/corridor/datasources/base.py)
+# ---------------------------------------------------------------------------
+# The engine does not care WHERE snapshots come from. Swapping a paid historical
+# estimates provider in later means changing these names + adding an adapter,
+# never rewriting the corridor/PEG math.
+data:
+  price_source: yfinance
+  estimate_source: yfinance      # CURRENT forward estimates only; history accrues going forward
+  fundamentals_source: edgar     # trailing/as-reported; backfill is honest here
+  # Engine version stamped onto derived valuation rows for reproducibility.
+  engine_version: "0.1.0"

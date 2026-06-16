@@ -1,0 +1,5 @@
+# This directory holds local, git-ignored point-in-time state:
+#   corridor.db        SQLite database (queryable state)
+#   snapshots/*.parquet Immutable raw point-in-time snapshots
+# The files themselves are never committed; the daily refresh job rebuilds and
+# accumulates them. This .gitkeep just preserves the directory.

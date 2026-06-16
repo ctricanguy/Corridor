@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "corridor"
+version = "0.1.0"
+description = "Personal equity-research engine: forward-P/E corridor, True P/E, forward PEG, and base-rate overlays for a focused large-cap tech/AI universe."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Corridor (personal use)" }]
+
+# Core runtime dependencies. Kept deliberately lean; NLP/FinBERT is an
+# optional extra (see [project.optional-dependencies]) and is NOT installed
+# by default — it is only a future hook (Factor 3).
+dependencies = [
+    # data wrangling
+    "pandas>=2.2",
+    "numpy>=1.26",
+    # data sources
+    "yfinance>=0.2.40",
+    "sec-edgar-downloader>=5.0",
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
+    # storage
+    "SQLAlchemy>=2.0",
+    "pyarrow>=16.0",          # Parquet point-in-time snapshots
+    # stats / backtest
+    "scipy>=1.13",
+    "statsmodels>=0.14",
+    # visualization + app
+    "plotly>=5.22",
+    "streamlit>=1.35",
+    # config
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Future hook only — Factor 3 FinBERT sentiment. Do not build against this yet.
+nlp = ["transformers>=4.40", "torch>=2.2"]
+# Developer tooling.
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "types-PyYAML>=6.0",
+    "types-requests>=2.32",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/corridor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "scripts", "app"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["corridor"]
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
