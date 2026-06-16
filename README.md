@@ -19,13 +19,22 @@ chart, a forward **PEG** chart, a per-company dashboard, and a watchlist overvie
 | Stage | Scope | State |
 |------:|-------|-------|
 | **0** | Scaffold: repo layout, deps, config, point-in-time schema, `.env.example` | ✅ **this commit** |
-| 1 | Data pipeline: EDGAR + yfinance ingestion, immutable daily snapshots | ⏳ next |
-| 2 | Valuation engine: True P/E series, bands, signals, forward PEG | ⏳ |
+| 1 | Data pipeline: FMP/yfinance/EDGAR adapters, window logic, consistency invariants, sanity gates, actuals loop | ✅ **adapters unvalidated** (see below) |
+| 2 | Valuation engine: True P/E series, bands, signals, forward PEG | ⏳ next |
 | 3 | Overlay: winning-streak study, RSI/MA, earnings flags | ⏳ |
 | 4 | Visualization + memos: the five charts, dashboard, memo generator | ⏳ |
 | 5 | Validation harness: walk-forward backtest on point-in-time data | ⏳ |
 
 Built in stages with a review pause between each.
+
+> **⚠️ The three data adapters (FMP, yfinance, EDGAR) are UNVALIDATED against live
+> endpoints.** They were built against documented API shapes but not run live (the
+> build sandbox blocks outbound network and has no API key). Their JSON parsing is
+> unit-tested against hand-built fixtures, and the True P/E math is verified by a
+> SYNTHETIC worked example — but before trusting real numbers you must run
+> `python scripts/validate_live.py` locally (needs `FMP_API_KEY` + network). It
+> re-checks the live data against the same shape contract the fixtures satisfy and
+> prints a real, hand-verifiable NVDA True P/E.
 
 ---
 
@@ -109,6 +118,65 @@ self-explanatory titles/labels/annotations, and thin-history charts marked as su
 
 ---
 
+## The data pipeline (Stage 1)
+
+The whole system's validity rests on two numbers per `(ticker, date)`: the
+forward-EPS sum and the price paired with it. The pipeline protects that pairing
+with invariants, each backed by an adversarial test:
+
+- **Sourcing & provenance.** Forward estimates from **FMP** (`period=quarter`, true
+  per-quarter forward EPS — viable on the **free tier**: 250 req/day easily covers
+  10 names accumulating daily); prices from **yfinance** (cross-checked against
+  FMP); realized actuals from **EDGAR XBRL** (diluted EPS, continuing ops, with
+  `filed_date`). Every value carries `source`, `observation_timestamp` (UTC), a
+  `basis`, and — for the forward sum — a `construction_method` string recording
+  *exactly* how it was built (e.g. "2 real quarterly + 2 derived from FY2027 annual").
+- **The window.** "Next 4 unreported quarters" is keyed off **confirmed report
+  dates** and each company's **own fiscal calendar** (NVDA ends late January, AAPL
+  September, AVGO November…), never calendar quarters. It rolls the moment a quarter
+  reports. Cross-checked against a provider-native NTM; divergence is flagged.
+- **Consistency invariants.** True P/E is computed on the **raw contemporaneous
+  basis** (raw price / raw EPS), so a split rescales numerator and denominator
+  together — no phantom discontinuity. EPS basis is tagged everywhere (estimates are
+  non-GAAP `adjusted_diluted`; EDGAR actuals are `gaap_diluted_continuing_ops`) and
+  never silently mixed. **Currency is a hard gate**: if report currency ≠ price
+  currency (any ADR), Corridor refuses to compute, quarantines to `ingestion_log`,
+  and shows an explicit *unsupported* state — never a naive mismatched P/E.
+- **Quality & gates.** Each snapshot gets a **coverage score** (real-vs-derived
+  fraction of the 4Q sum). Impossible values — non-positive price, an unexplained
+  EPS-sum sign flip, a >Nx True P/E jump with no split — are **quarantined** to
+  `ingestion_log` with a reason code, never written to the live tables, never
+  dropped silently.
+- **Actuals feedback loop.** When a quarter reports, the EDGAR actual is compared to
+  the estimate that was **live the day before**, accumulating per-source accuracy so
+  we can later learn whether a source's consensus is any good (with the GAAP-vs-
+  non-GAAP basis mismatch flagged honestly).
+
+### Foreign / ADR names — excluded from v1 on purpose
+
+None of the 10 watchlist names are ADRs. The currency-match guard is a deliberate
+guardrail, not a bug: supporting an ADR (e.g. TSM — TWD reporter, USD ADR, 5:1
+share ratio) requires FX + share-ratio handling, to be built and tested against a
+real ADR later. See the `TODO(adr)` in `src/corridor/ingest/job.py` and the
+`unsupported:` block in `config.yaml`.
+
+### Live validation (do this before trusting real numbers)
+
+```bash
+# 1. Hand-verify the MATH (no network needed) — clearly synthetic:
+python scripts/nvda_worked_example.py
+
+# 2. Validate the adapters against LIVE data (needs key + network):
+export FMP_API_KEY=...                       # your FMP key
+export SEC_EDGAR_USER_AGENT="You <you@email>"
+python scripts/validate_live.py              # prints a real, hand-verifiable NVDA True P/E
+
+# 3. Once validated, run the daily snapshot job:
+python scripts/daily_refresh.py
+```
+
+---
+
 ## Repository layout
 
 ```
@@ -119,23 +187,37 @@ Corridor/
 ├── Makefile                 # install / init-db / schema / test / app
 ├── src/corridor/
 │   ├── config.py            # .env + config.yaml loaders (typed)
+│   ├── constants.py         # bases / methods / statuses / quarantine reason codes
 │   ├── db/
 │   │   ├── models.py        # POINT-IN-TIME schema (source of truth)
 │   │   └── database.py      # engine, sessions, immutability triggers, init_db
-│   ├── datasources/
-│   │   └── base.py          # swappable source interfaces (Price/Estimate/Fundamentals)
+│   ├── datasources/         # swappable adapters — UNVALIDATED until validate_live.py
+│   │   ├── base.py          # interfaces + record dataclasses
+│   │   ├── fmp_source.py    # FMP forward estimates (PRIMARY) + price cross-check
+│   │   ├── yfinance_source.py  # prices (raw + adjusted, split ratios)
+│   │   ├── edgar_source.py  # realized diluted EPS (continuing ops, filed dates)
+│   │   └── shape.py         # record shape contract (fixtures <-> live)
+│   ├── ingest/              # Stage 1 PIPELINE (pure, testable)
+│   │   ├── fiscal.py        # per-company fiscal calendars + quarter enumeration
+│   │   ├── window.py        # next-4-unreported-quarter window
+│   │   ├── forward_sum.py   # 4Q sum + construction_method + coverage
+│   │   ├── consistency.py   # currency guard, time alignment, split-safe True P/E
+│   │   ├── gates.py         # write-time sanity gates (quarantine)
+│   │   ├── reconcile.py     # multi-source price + NTM cross-checks
+│   │   ├── actuals.py       # beat/miss vs pre-report estimate + source accuracy
+│   │   └── job.py           # assemble_valuation (pure) + run_daily (injected sources)
 │   ├── engine/
-│   │   └── earnings.py      # Factor 1 EarningsModel seam (corridor/peg/overlay: later)
-│   ├── ingest/              # Stage 1 — daily snapshot job
-│   ├── viz/                 # Stage 4 — plotly charts
-│   ├── memo/                # Stage 4 — memo generator
-│   └── backtest/            # Stage 5 — validation harness
+│   │   └── earnings.py      # Factor 1 EarningsModel seam (corridor/peg: Stage 2)
+│   ├── viz/ memo/ backtest/ # Stage 4 / 5
 ├── app/dashboard.py         # Streamlit entry point (Stage 4)
 ├── scripts/
 │   ├── init_db.py           # create schema + seed watchlist
 │   ├── dump_schema.py       # print generated DDL for review
-│   └── daily_refresh.py     # Stage 1 daily job (stub)
-└── tests/                   # pytest: schema immutability, config
+│   ├── nvda_worked_example.py  # SYNTHETIC True P/E walk-through (validates math)
+│   ├── validate_live.py     # LIVE adapter validation (key + network) — real NVDA number
+│   └── daily_refresh.py     # Stage 1 daily snapshot job
+└── tests/                   # pytest: window, forward sum, consistency, gates,
+    └── fixtures/            #   reconcile, actuals, adapter parse, pipeline (45 tests)
 ```
 
 ### Why Streamlit (not FastAPI + React)

@@ -58,7 +58,11 @@ class Base(DeclarativeBase):
 # Tables whose rows are an immutable historical record. Application code must
 # only ever INSERT into these; init_db installs DB triggers that reject UPDATE
 # and DELETE so point-in-time integrity cannot be violated even by accident.
-IMMUTABLE_TABLES: tuple[str, ...] = ("forward_estimate_snapshots", "fundamentals")
+IMMUTABLE_TABLES: tuple[str, ...] = (
+    "forward_estimate_snapshots",
+    "fundamentals",
+    "realized_actuals",
+)
 
 
 class Security(Base):
@@ -100,10 +104,18 @@ class PriceSnapshot(Base):
     open: Mapped[float | None] = mapped_column(Float)
     high: Mapped[float | None] = mapped_column(Float)
     low: Mapped[float | None] = mapped_column(Float)
-    close: Mapped[float | None] = mapped_column(Float)
-    adj_close: Mapped[float | None] = mapped_column(Float)
+    close: Mapped[float | None] = mapped_column(Float)  # RAW (unadjusted) close
+    adj_close: Mapped[float | None] = mapped_column(Float)  # split/dividend adjusted
     volume: Mapped[int | None] = mapped_column(Integer)
+    # This bar's split ratio (e.g. 10.0 on a 10:1 ex-date, else 1.0). Lets the
+    # True P/E sanity gate tell a legitimate split-driven rescale apart from an
+    # anomalous jump. The canonical True P/E uses RAW close paired with RAW EPS,
+    # which is split-consistent by construction (both rescale on the same date).
+    split_ratio: Mapped[float] = mapped_column(Float, default=1.0)
+    currency: Mapped[str] = mapped_column(String(8), default="USD")  # price currency
     source: Mapped[str] = mapped_column(String(32), default="yfinance")
+    # UTC instant the bar was fetched (provenance; distinct from price_date).
+    observation_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
     ingested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     security: Mapped[Security] = relationship(back_populates="price_snapshots")
@@ -151,7 +163,20 @@ class ForwardEstimateSnapshot(Base):
     metric: Mapped[str] = mapped_column(String(16))
     value: Mapped[float] = mapped_column(Float)
     num_analysts: Mapped[int | None] = mapped_column(Integer)
-    source: Mapped[str] = mapped_column(String(32), default="yfinance", index=True)
+    # --- provenance carried on EVERY stored value (Stage 1 invariant) ---
+    # EPS basis, e.g. 'adjusted_diluted' (non-GAAP consensus). Never mixed
+    # silently with the GAAP basis of realized actuals.
+    basis: Mapped[str] = mapped_column(String(32), default="adjusted_diluted")
+    # Report currency for this estimate (drives the hard currency-match guard).
+    currency: Mapped[str] = mapped_column(String(8), default="USD")
+    # EXACTLY how this value was built: a raw provider quarterly estimate, or a
+    # quarter derived by splitting an annual estimate. Never anonymous.
+    construction_method: Mapped[str] = mapped_column(String(48), default="real_quarterly")
+    # True when this quarter was derived from an annual figure (lowers coverage).
+    is_derived: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(32), default="fmp", index=True)
+    # UTC instant observed — finer-grained companion to as_of_date.
+    observation_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
     ingested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     security: Mapped[Security] = relationship(back_populates="forward_estimates")
@@ -214,9 +239,29 @@ class ValuationSnapshot(Base):
     ticker: Mapped[str] = mapped_column(ForeignKey("securities.ticker"), index=True)
     as_of_date: Mapped[date] = mapped_column(Date, index=True)
 
-    price: Mapped[float | None] = mapped_column(Float)
+    price: Mapped[float | None] = mapped_column(Float)  # the RAW close paired with the sum
     forward_eps_ntm: Mapped[float | None] = mapped_column(Float)  # sum of next 4 qtr EPS
     true_pe: Mapped[float | None] = mapped_column(Float)
+
+    # --- Stage 1 provenance + quality (populated by the data pipeline) ---
+    # EXACTLY how the 4Q sum was built, e.g.
+    # "2 real quarterly (2026Q3,2026Q4) + 2 derived from FY2027 annual".
+    construction_method: Mapped[str | None] = mapped_column(String(160))
+    # Fraction of the 4Q sum that is real quarterly estimates vs derived (0..1).
+    coverage_score: Mapped[float | None] = mapped_column(Float)
+    price_basis: Mapped[str | None] = mapped_column(String(24))  # 'raw'
+    eps_basis: Mapped[str | None] = mapped_column(String(32))  # 'adjusted_diluted'
+    price_currency: Mapped[str | None] = mapped_column(String(8))
+    report_currency: Mapped[str | None] = mapped_column(String(8))
+    # Cross-check: provider-native NTM EPS vs our strict 4Q sum.
+    ntm_eps_native: Mapped[float | None] = mapped_column(Float)
+    ntm_divergence_pct: Mapped[float | None] = mapped_column(Float)
+    window_divergence_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Multi-source price reconciliation (both values logged, flag set on disagree).
+    price_yf: Mapped[float | None] = mapped_column(Float)
+    price_fmp: Mapped[float | None] = mapped_column(Float)
+    price_disagreement_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+    observation_timestamp: Mapped[datetime | None] = mapped_column(DateTime)  # UTC
 
     # Historical forward-P/E distribution (the corridor, in multiple space).
     pe_median: Mapped[float | None] = mapped_column(Float)
@@ -311,6 +356,83 @@ class IngestionLog(Base):
     job: Mapped[str] = mapped_column(String(32))  # 'daily_refresh', 'backfill_edgar', ...
     ticker: Mapped[str | None] = mapped_column(String(16), index=True)
     source: Mapped[str | None] = mapped_column(String(32))
-    status: Mapped[str] = mapped_column(String(16))  # ok | partial | missing | error
+    status: Mapped[str] = mapped_column(String(16))  # ok|partial|missing|error|quarantine
     detail: Mapped[str | None] = mapped_column(Text)
     rows_written: Mapped[int | None] = mapped_column(Integer)
+    # For quarantined values: the machine reason code (see corridor.constants).
+    reason_code: Mapped[str | None] = mapped_column(String(48), index=True)
+
+
+class RealizedActual(Base):
+    """IMMUTABLE realized EPS actuals + the beat/miss vs the pre-report estimate.
+
+    When a quarter reports, we pull the EDGAR actual (GAAP diluted from continuing
+    operations) with its ``filed_date`` and compare it to the estimate snapshot
+    that was LIVE the day before the report. This is the feedback loop that makes
+    the data useful over time: it accumulates evidence about whether a given
+    source's consensus is any good for these names.
+
+    BASIS HONESTY: estimates are non-GAAP ``adjusted_diluted`` while EDGAR actuals
+    are ``gaap_diluted_continuing_ops``. These bases differ, so ``basis_mismatch``
+    is set whenever they do and the surprise is marked low-confidence rather than
+    silently treated as like-for-like. A same-basis (non-GAAP actual) comparison
+    is a later refinement; the hook is here.
+    """
+
+    __tablename__ = "realized_actuals"
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker",
+            "fiscal_period",
+            "estimate_source",
+            "filed_date",
+            name="uq_actual_ticker_period_estsrc_filed",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(ForeignKey("securities.ticker"), index=True)
+    fiscal_period: Mapped[str] = mapped_column(String(12))
+    period_end_date: Mapped[date | None] = mapped_column(Date)
+    report_date: Mapped[date | None] = mapped_column(Date, index=True)
+    filed_date: Mapped[date | None] = mapped_column(Date)
+
+    actual_eps: Mapped[float | None] = mapped_column(Float)
+    actual_basis: Mapped[str | None] = mapped_column(String(32))  # gaap_diluted_continuing_ops
+
+    # The estimate snapshot that was live the day BEFORE the report.
+    estimate_eps: Mapped[float | None] = mapped_column(Float)
+    estimate_basis: Mapped[str | None] = mapped_column(String(32))  # adjusted_diluted
+    estimate_source: Mapped[str] = mapped_column(String(32))
+    estimate_as_of_date: Mapped[date | None] = mapped_column(Date)
+
+    surprise_abs: Mapped[float | None] = mapped_column(Float)  # actual - estimate
+    surprise_pct: Mapped[float | None] = mapped_column(Float)
+    beat: Mapped[bool | None] = mapped_column(Boolean)  # sign of the surprise
+    basis_mismatch: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    ingested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class SourceAccuracy(Base):
+    """Recomputable rollup of per-source estimate accuracy (MUTABLE / upsert).
+
+    Aggregates RealizedActual rows so we can later weight or distrust a source on
+    evidence. ``ticker`` is NULL for an all-names rollup. Recomputable from the
+    immutable actuals, so this table is upserted, not point-in-time.
+    """
+
+    __tablename__ = "source_accuracy"
+    __table_args__ = (
+        UniqueConstraint("source", "ticker", name="uq_srcacc_source_ticker"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    ticker: Mapped[str | None] = mapped_column(String(16), index=True)  # NULL = overall
+    n_observations: Mapped[int] = mapped_column(Integer, default=0)
+    mean_abs_pct_error: Mapped[float | None] = mapped_column(Float)
+    median_pct_error: Mapped[float | None] = mapped_column(Float)
+    hit_rate: Mapped[float | None] = mapped_column(Float)  # fraction where sign matched
+    same_basis_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

@@ -130,7 +130,49 @@ overlay:
 # never rewriting the corridor/PEG math.
 data:
   price_source: yfinance
-  estimate_source: yfinance      # CURRENT forward estimates only; history accrues going forward
-  fundamentals_source: edgar     # trailing/as-reported; backfill is honest here
+  forward_estimate_source: fmp   # PRIMARY: FMP gives true per-quarter forward EPS
+  price_crosscheck_source: fmp   # cross-check yfinance price against FMP for the same date
+  fundamentals_source: edgar     # trailing/as-reported actuals; backfill is honest here
   # Engine version stamped onto derived valuation rows for reproducibility.
   engine_version: "0.1.0"
+  # FMP endpoint config. The API key lives in .env (FMP_API_KEY), never here.
+  # NOTE: all three adapters are UNVALIDATED against live endpoints until
+  # scripts/validate_live.py has been run with a real key + network.
+  fmp:
+    base_url: "https://financialmodelingprep.com"
+    forward_window_buffer_days: 120   # retain a just-ended, unreported quarter
+
+  # Reconciliation / sanity thresholds (each one is exercised by a test).
+  thresholds:
+    ntm_divergence_pct: 0.10      # strict 4Q sum vs provider-native NTM -> flag
+    price_disagreement_pct: 0.01  # yfinance vs FMP price -> flag (store both)
+    true_pe_jump_factor: 2.0      # >Nx day-over-day move w/o split -> quarantine
+
+  # Per-company fiscal-year-end (month, day). MANY of these are off-calendar; the
+  # corridor window MUST use the company's own fiscal quarters. These seeds are
+  # cross-checked against EDGAR period-end dates by scripts/validate_live.py.
+  fiscal_calendars:
+    NVDA: {fy_end_month: 1,  fy_end_day: 31, note: "FY ends late January (e.g. 2026-01-25)"}
+    MSFT: {fy_end_month: 6,  fy_end_day: 30, note: "FY ends June 30"}
+    AAPL: {fy_end_month: 9,  fy_end_day: 28, note: "FY ends last Saturday of September"}
+    AVGO: {fy_end_month: 11, fy_end_day: 3,  note: "52/53-week FY ends early November"}
+    MU:   {fy_end_month: 8,  fy_end_day: 29, note: "FY ends Thursday nearest Aug 31"}
+    GOOGL: {fy_end_month: 12, fy_end_day: 31, note: "calendar year"}
+    AMZN: {fy_end_month: 12, fy_end_day: 31, note: "calendar year"}
+    META: {fy_end_month: 12, fy_end_day: 31, note: "calendar year"}
+    TSLA: {fy_end_month: 12, fy_end_day: 31, note: "calendar year"}
+    AMD:  {fy_end_month: 12, fy_end_day: 31, note: "calendar year (last Saturday of Dec)"}
+
+# ---------------------------------------------------------------------------
+# Unsupported names (foreign / ADR) — EXCLUDED from v1 on purpose
+# ---------------------------------------------------------------------------
+# These are NOT bugs to work around. v1 enforces a HARD currency-match guard: if a
+# ticker's report currency != its price currency, Corridor refuses to compute True
+# P/E / PEG, quarantines the snapshot to ingestion_log ("currency mismatch —
+# unsupported in v1"), and surfaces an explicit "unsupported" state. Supporting an
+# ADR is a PREREQUISITE task (FX conversion + ADR share ratio), to be built and
+# tested against a real ADR when one is actually added — see the TODO in
+# src/corridor/ingest/job.py. Example left here as documentation:
+unsupported:
+  - ticker: TSM
+    reason: "ADR — TWD reporter vs USD price; needs FX + 5:1 ADR share ratio (not in v1)"

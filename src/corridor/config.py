@@ -14,10 +14,13 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    from .ingest.fiscal import FiscalCalendar
 
 # Project root = two levels up from this file (src/corridor/config.py -> repo root).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -75,6 +78,7 @@ class Config:
     peg: dict[str, Any] = field(default_factory=dict)
     overlay: dict[str, Any] = field(default_factory=dict)
     data: dict[str, Any] = field(default_factory=dict)
+    unsupported: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def tickers(self) -> list[str]:
@@ -84,6 +88,35 @@ class Config:
     @property
     def engine_version(self) -> str:
         return str(self.data.get("engine_version", "0.1.0"))
+
+    @property
+    def thresholds(self) -> dict[str, Any]:
+        """Reconciliation / sanity thresholds (with defaults if absent)."""
+        defaults = {
+            "ntm_divergence_pct": 0.10,
+            "price_disagreement_pct": 0.01,
+            "true_pe_jump_factor": 2.0,
+        }
+        return {**defaults, **self.data.get("thresholds", {})}
+
+    @property
+    def unsupported_tickers(self) -> set[str]:
+        """Tickers excluded from v1 (foreign/ADR). Currency guard enforces this too."""
+        return {str(item["ticker"]).upper() for item in self.unsupported if "ticker" in item}
+
+    def fiscal_calendars(self) -> dict[str, FiscalCalendar]:
+        """Build per-ticker FiscalCalendar objects from config (off-calendar aware)."""
+        from .ingest.fiscal import FiscalCalendar
+
+        raw = self.data.get("fiscal_calendars", {}) or {}
+        out: dict[str, FiscalCalendar] = {}
+        for ticker, spec in raw.items():
+            out[str(ticker).upper()] = FiscalCalendar(
+                fy_end_month=int(spec["fy_end_month"]),
+                fy_end_day=int(spec.get("fy_end_day", 31)),
+                note=str(spec.get("note", "")),
+            )
+        return out
 
 
 def load_config(path: str | Path | None = None) -> Config:
@@ -96,7 +129,7 @@ def load_config(path: str | Path | None = None) -> Config:
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
     if not config_path.exists():
         raise FileNotFoundError(
-            f"config.yaml not found at {config_path}. Copy the seed config or pass an explicit path."
+            f"config.yaml not found at {config_path}. Copy the seed config or pass a path."
         )
     raw: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
 
@@ -115,4 +148,5 @@ def load_config(path: str | Path | None = None) -> Config:
         peg=raw.get("peg", {}),
         overlay=raw.get("overlay", {}),
         data=raw.get("data", {}),
+        unsupported=raw.get("unsupported", []) or [],
     )

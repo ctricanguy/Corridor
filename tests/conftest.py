@@ -7,12 +7,21 @@ schema and immutability guards installed.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from corridor.db import database, init_db
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def load_fixture(name: str) -> Any:
+    """Load a hand-built JSON fixture from tests/fixtures/."""
+    return json.loads((FIXTURES / name).read_text())
 
 
 @pytest.fixture

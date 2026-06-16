@@ -65,23 +65,21 @@ def test_forward_estimate_update_is_blocked(db_url: str) -> None:
     """Point-in-time integrity: UPDATE on snapshots must be rejected by the DB."""
     database.get_engine(db_url)
     _seed_estimate()
-    with pytest.raises(IntegrityError):
-        with session_scope() as s:
-            s.execute(
-                text(
-                    "UPDATE forward_estimate_snapshots SET value = 9.99 "
-                    "WHERE ticker = 'NVDA'"
-                )
+    with pytest.raises(IntegrityError), session_scope() as s:
+        s.execute(
+            text(
+                "UPDATE forward_estimate_snapshots SET value = 9.99 "
+                "WHERE ticker = 'NVDA'"
             )
+        )
 
 
 def test_forward_estimate_delete_is_blocked(db_url: str) -> None:
     """Point-in-time integrity: DELETE on snapshots must be rejected by the DB."""
     database.get_engine(db_url)
     _seed_estimate()
-    with pytest.raises(IntegrityError):
-        with session_scope() as s:
-            s.execute(text("DELETE FROM forward_estimate_snapshots WHERE ticker = 'NVDA'"))
+    with pytest.raises(IntegrityError), session_scope() as s:
+        s.execute(text("DELETE FROM forward_estimate_snapshots WHERE ticker = 'NVDA'"))
     # Row still present after the blocked delete.
     with session_scope() as s:
         assert s.query(ForwardEstimateSnapshot).count() == 1

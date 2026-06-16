@@ -1,0 +1,413 @@
+"""Daily pipeline orchestration.
+
+``assemble_valuation`` is the PURE core: given a day's price, estimates, fiscal
+periods, and the prior snapshot, it runs the window logic, builds the forward sum,
+applies the consistency invariants and sanity gates, and returns either a clean
+ValuationInput or a quarantine decision — with NO I/O, so it is fully unit-tested
+against adversarial fixtures.
+
+``run_daily`` is the thin wrapper that fetches via injected data sources and
+persists results idempotently. Sources are injected so the whole job runs offline
+in tests with fake sources.
+
+TODO(adr): foreign/ADR support. v1 hard-rejects any ticker whose report currency
+!= price currency (currency_guard). Supporting an ADR (e.g. TSM: TWD reporter, USD
+ADR, 5:1 share ratio) requires FX conversion + ADR-ratio handling here, built and
+tested against a real ADR. Until then such names stay 'unsupported' in config.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING, Any
+
+from ..constants import (
+    EPS_BASIS_ADJUSTED_DILUTED,
+    JOB_DAILY_REFRESH,
+    REASON_INCOMPLETE_WINDOW,
+    STATUS_OK,
+    STATUS_QUARANTINE,
+)
+from ..datasources.base import (
+    ForwardEstimateRecord,
+    ForwardEstimateSource,
+    FundamentalsSource,
+    PriceRecord,
+    PriceSource,
+)
+from . import consistency, gates
+from .fiscal import FiscalCalendar, enumerate_fiscal_quarters
+from .forward_sum import build_forward_eps_sum
+from .reconcile import ntm_cross_check, reconcile_prices
+from .records import FiscalPeriod, PricePoint, ValuationInput
+from .window import unreported_window
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from ..config import Config
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PriorSnapshot:
+    """Just enough of the previous valuation snapshot to run the day-over-day gates."""
+
+    forward_eps_sum: float
+    true_pe: float
+
+
+@dataclass
+class PipelineResult:
+    """Outcome for one ticker on one date."""
+
+    ticker: str
+    as_of: date
+    status: str  # ok | quarantine | unsupported | incomplete | error
+    reason_code: str | None = None
+    detail: str | None = None
+    valuation: ValuationInput | None = None
+    forward_records: list[ForwardEstimateRecord] = field(default_factory=list)
+
+    @property
+    def is_clean(self) -> bool:
+        return self.status == STATUS_OK and self.valuation is not None
+
+
+def _split_estimates(
+    records: list[ForwardEstimateRecord],
+) -> tuple[dict[str, float], dict[str, float]]:
+    quarterly = {
+        r.fiscal_period: r.value
+        for r in records
+        if r.metric == "eps" and r.period_type == "quarter"
+    }
+    annual = {
+        r.fiscal_period: r.value
+        for r in records
+        if r.metric == "eps" and r.period_type == "annual"
+    }
+    return quarterly, annual
+
+
+def assemble_valuation(
+    *,
+    ticker: str,
+    as_of: date,
+    price_point: PricePoint,
+    report_currency: str,
+    estimate_records: list[ForwardEstimateRecord],
+    fiscal_periods: list[FiscalPeriod],
+    prior: PriorSnapshot | None = None,
+    crosscheck_price_fmp: float | None = None,
+    native_ntm: float | None = None,
+    earnings_event: bool = False,
+    thresholds: dict[str, float] | None = None,
+    n_quarters: int = 4,
+) -> PipelineResult:
+    """Run the full consistency + quality pipeline for one ticker/date (pure)."""
+    th = {
+        "ntm_divergence_pct": 0.10,
+        "price_disagreement_pct": 0.01,
+        "true_pe_jump_factor": 2.0,
+        **(thresholds or {}),
+    }
+
+    def quarantine(reason: str, detail: str) -> PipelineResult:
+        return PipelineResult(ticker, as_of, "quarantine", reason, detail)
+
+    # 1. Hard currency-match guard (ADRs unsupported in v1) -------------------
+    cur = consistency.currency_guard(report_currency, price_point.currency)
+    if not cur.passed:
+        return PipelineResult(ticker, as_of, "unsupported", cur.reason_code, cur.detail)
+
+    # 2. Time alignment: paired price date must equal estimate observation date
+    align = consistency.time_alignment_guard(price_point.price_date, as_of)
+    if not align.passed:
+        return quarantine(align.reason_code, align.detail)  # type: ignore[arg-type]
+
+    # 3. Forward window (report-date driven, company fiscal calendar) ---------
+    window = unreported_window(fiscal_periods, as_of, n=n_quarters)
+    quarterly, annual = _split_estimates(estimate_records)
+    fwd = build_forward_eps_sum(window, quarterly, annual)
+    if not fwd.complete:
+        return PipelineResult(
+            ticker, as_of, "incomplete", REASON_INCOMPLETE_WINDOW, fwd.construction_method
+        )
+
+    # 4. True P/E on the canonical raw contemporaneous basis ------------------
+    prior_sum = prior.forward_eps_sum if prior else None
+    if fwd.value <= 0:
+        # A non-positive forward sum is gated below (sign flip) but division is
+        # undefined; route straight to the sign-flip gate for a clean reason.
+        gate = gates.gate_eps_sign_flip(fwd.value, prior_sum, earnings_event)
+        if not gate.passed:
+            return quarantine(gate.reason_code, gate.detail)  # type: ignore[arg-type]
+    true_pe = (
+        consistency.compute_true_pe(price_point.raw_close, fwd.value) if fwd.value > 0 else 0.0
+    )
+
+    # 5. Sanity gates (quarantine, never store) -------------------------------
+    gate = gates.run_sanity_gates(
+        price=price_point.raw_close,
+        current_eps_sum=fwd.value,
+        prior_eps_sum=prior.forward_eps_sum if prior else None,
+        current_true_pe=true_pe,
+        prior_true_pe=prior.true_pe if prior else None,
+        earnings_event=earnings_event,
+        split_occurred=price_point.split_ratio != 1.0,
+        jump_factor=th["true_pe_jump_factor"],
+    )
+    if not gate.passed:
+        return quarantine(gate.reason_code, gate.detail)  # type: ignore[arg-type]
+
+    # 6. Cross-checks (flag, do NOT discard) ----------------------------------
+    price_recon = reconcile_prices(
+        price_point.raw_close, crosscheck_price_fmp, th["price_disagreement_pct"]
+    )
+    ntm = ntm_cross_check(fwd.value, native_ntm, th["ntm_divergence_pct"])
+    if price_recon.disagreement_flag:
+        logger.warning("%s price disagreement: %s", ticker, price_recon.detail)
+    if ntm.divergence_flag:
+        logger.warning("%s NTM divergence: %s", ticker, ntm.detail)
+
+    valuation = ValuationInput(
+        ticker=ticker,
+        as_of_date=as_of,
+        price=price_point.raw_close,
+        forward_eps_sum=fwd.value,
+        true_pe=true_pe,
+        coverage_score=fwd.coverage_score,
+        construction_method=fwd.construction_method,
+        price_basis=consistency.TRUE_PE_PRICE_BASIS,
+        eps_basis=EPS_BASIS_ADJUSTED_DILUTED,
+        price_currency=price_point.currency,
+        report_currency=report_currency,
+        ntm_eps_native=native_ntm,
+        ntm_divergence_pct=ntm.divergence_pct,
+        window_divergence_flag=ntm.divergence_flag,
+        price_yf=price_recon.price_yf,
+        price_fmp=price_recon.price_fmp,
+        price_disagreement_flag=price_recon.disagreement_flag,
+        components=fwd.components,
+    )
+    return PipelineResult(
+        ticker, as_of, STATUS_OK, valuation=valuation, forward_records=estimate_records
+    )
+
+
+def build_fiscal_periods(
+    estimate_records: list[ForwardEstimateRecord],
+    reported: dict[str, date],
+    cal: FiscalCalendar,
+    as_of: date,
+    horizon: int = 8,
+) -> list[FiscalPeriod]:
+    """Assemble fiscal periods for the window from the calendar + observed data.
+
+    Quarters are ENUMERATED from the company's fiscal calendar (so a quarter we will
+    derive from an annual estimate still appears), then refined with the exact
+    period-end dates we actually have from quarterly estimates and with confirmed
+    report dates from ``reported`` (e.g. EDGAR filing dates). Future quarters get an
+    estimated report date (~21 days after period end) and stay unconfirmed.
+    """
+    exact_end = {
+        r.fiscal_period: r.period_end_date
+        for r in estimate_records
+        if r.period_type == "quarter" and r.period_end_date is not None
+    }
+    periods: list[FiscalPeriod] = []
+    for label, approx_end in enumerate_fiscal_quarters(cal, as_of, horizon=horizon):
+        end = exact_end.get(label, approx_end)
+        confirmed_date = reported.get(label)
+        report_date = confirmed_date or date.fromordinal(end.toordinal() + 21)
+        periods.append(
+            FiscalPeriod(
+                fiscal_period=label,
+                period_end_date=end,
+                report_date=report_date,
+                confirmed=confirmed_date is not None,
+            )
+        )
+    return sorted(periods, key=lambda p: (p.period_end_date, p.fiscal_period))
+
+
+# --- persistence ------------------------------------------------------------
+def _insert_or_ignore(
+    session: Session, model: Any, values: dict[str, Any], index_elements: list[str]
+) -> int:
+    """INSERT OR IGNORE on the natural key (idempotent; never trips the immutability
+    triggers because it is an INSERT, not an UPDATE)."""
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    stmt = (
+        sqlite_insert(model).values(**values).on_conflict_do_nothing(index_elements=index_elements)
+    )
+    result = session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
+    config: Config,
+    *,
+    price_source: PriceSource,
+    estimate_source: ForwardEstimateSource,
+    fundamentals_source: FundamentalsSource,
+    session: Session,
+    as_of: date | None = None,
+    reported_by_ticker: dict[str, dict[str, date]] | None = None,
+) -> list[PipelineResult]:
+    """Fetch + assemble + persist for every supported ticker. Sources are injected.
+
+    Every ticker ends in ingestion_log (ok|quarantine|unsupported|incomplete|error);
+    no silent gaps. Clean rows write valuation_snapshots; raw estimates/prices write
+    their immutable tables idempotently; quarantines write only ingestion_log.
+    """
+    from ..db.models import ForwardEstimateSnapshot, IngestionLog, PriceSnapshot, ValuationSnapshot
+
+    as_of = as_of or datetime.now(UTC).date()
+    cals = config.fiscal_calendars()
+    thresholds = config.thresholds
+    unsupported = config.unsupported_tickers
+    reported_by_ticker = reported_by_ticker or {}
+    results: list[PipelineResult] = []
+
+    for spec in config.universe:
+        ticker = spec.ticker
+        try:
+            if ticker in unsupported:
+                _log(session, IngestionLog, ticker, STATUS_QUARANTINE,
+                     "configured unsupported (foreign/ADR)", "currency_mismatch_unsupported_v1")
+                results.append(PipelineResult(ticker, as_of, "unsupported"))
+                continue
+
+            prices = price_source.get_prices(ticker, start=as_of)
+            price_rec = _price_on(prices, as_of)
+            estimates = estimate_source.get_forward_estimates(ticker, as_of=as_of)
+            if price_rec is None or not estimates:
+                _log(session, IngestionLog, ticker, "missing",
+                     f"price={'ok' if price_rec else 'MISSING'} estimates={len(estimates)}", None)
+                results.append(PipelineResult(ticker, as_of, "error", detail="missing inputs"))
+                continue
+
+            cal = cals.get(ticker, FiscalCalendar(fy_end_month=12))
+            reported = reported_by_ticker.get(ticker, {})
+            periods = build_fiscal_periods(estimates, reported, cal, as_of)
+            crosscheck = _safe_fmp_price(estimate_source, ticker, as_of)
+
+            result = assemble_valuation(
+                ticker=ticker,
+                as_of=as_of,
+                price_point=_to_point(price_rec),
+                report_currency=estimates[0].currency,
+                estimate_records=estimates,
+                fiscal_periods=periods,
+                crosscheck_price_fmp=crosscheck,
+                thresholds=thresholds,
+            )
+
+            # Persist raw immutable snapshots (idempotent) regardless of outcome.
+            for r in estimates:
+                _insert_or_ignore(session, ForwardEstimateSnapshot, _fwd_row(r),
+                                  ["ticker", "as_of_date", "fiscal_period", "metric", "source"])
+            _insert_or_ignore(session, PriceSnapshot, _price_row(price_rec),
+                              ["ticker", "price_date", "source"])
+
+            if result.is_clean and result.valuation is not None:
+                valuation = result.valuation
+                _insert_or_ignore(session, ValuationSnapshot,
+                                  _val_row(valuation, config.engine_version),
+                                  ["ticker", "as_of_date", "engine_version"])
+                _log(session, IngestionLog, ticker, STATUS_OK,
+                     valuation.construction_method, None, rows_written=1)
+            else:
+                _log(session, IngestionLog, ticker, STATUS_QUARANTINE,
+                     result.detail, result.reason_code)
+            results.append(result)
+        except Exception as exc:  # no silent failures
+            logger.exception("daily_refresh failed for %s", ticker)
+            _log(session, IngestionLog, ticker, "error", str(exc), None)
+            results.append(PipelineResult(ticker, as_of, "error", detail=str(exc)))
+    session.commit()
+    return results
+
+
+# --- small persistence/translation helpers ---------------------------------
+def _log(
+    session: Session,
+    model: Any,
+    ticker: str | None,
+    status: str,
+    detail: str | None,
+    reason: str | None,
+    rows_written: int | None = None,
+) -> None:
+    session.add(model(job=JOB_DAILY_REFRESH, ticker=ticker, source="pipeline", status=status,
+                      detail=detail, reason_code=reason, rows_written=rows_written))
+
+
+def _price_on(prices: list[PriceRecord], as_of: date) -> PriceRecord | None:
+    for p in prices:
+        if p.price_date == as_of:
+            return p
+    return None
+
+
+def _to_point(p: PriceRecord) -> PricePoint:
+    return PricePoint(
+        price_date=p.price_date,
+        raw_close=p.close if p.close is not None else 0.0,
+        adj_close=p.adj_close,
+        split_ratio=p.split_ratio,
+        currency=p.currency,
+        source=p.source,
+    )
+
+
+def _safe_fmp_price(estimate_source: Any, ticker: str, as_of: date) -> float | None:
+    fetch = getattr(estimate_source, "fetch_price", None)
+    if fetch is None:
+        return None
+    try:
+        price: float | None = fetch(ticker, as_of)
+        return price
+    except Exception:
+        logger.warning("FMP price cross-check unavailable for %s", ticker)
+        return None
+
+
+def _fwd_row(r: ForwardEstimateRecord) -> dict[str, Any]:
+    return {
+        "ticker": r.ticker, "as_of_date": r.as_of_date, "period_type": r.period_type,
+        "fiscal_period": r.fiscal_period, "period_end_date": r.period_end_date,
+        "metric": r.metric, "value": r.value, "num_analysts": r.num_analysts,
+        "basis": r.basis, "currency": r.currency, "construction_method": r.construction_method,
+        "is_derived": r.is_derived, "source": r.source,
+        "observation_timestamp": r.observation_timestamp,
+    }
+
+
+def _price_row(p: PriceRecord) -> dict[str, Any]:
+    return {
+        "ticker": p.ticker, "price_date": p.price_date, "open": p.open, "high": p.high,
+        "low": p.low, "close": p.close, "adj_close": p.adj_close, "volume": p.volume,
+        "split_ratio": p.split_ratio, "currency": p.currency, "source": p.source,
+        "observation_timestamp": p.observation_timestamp,
+    }
+
+
+def _val_row(v: ValuationInput, engine_version: str) -> dict[str, Any]:
+    return {
+        "ticker": v.ticker, "as_of_date": v.as_of_date, "price": v.price,
+        "forward_eps_ntm": v.forward_eps_sum, "true_pe": v.true_pe,
+        "construction_method": v.construction_method, "coverage_score": v.coverage_score,
+        "price_basis": v.price_basis, "eps_basis": v.eps_basis,
+        "price_currency": v.price_currency, "report_currency": v.report_currency,
+        "ntm_eps_native": v.ntm_eps_native, "ntm_divergence_pct": v.ntm_divergence_pct,
+        "window_divergence_flag": v.window_divergence_flag, "price_yf": v.price_yf,
+        "price_fmp": v.price_fmp, "price_disagreement_flag": v.price_disagreement_flag,
+        "is_thin_history": True, "engine_version": engine_version,
+    }

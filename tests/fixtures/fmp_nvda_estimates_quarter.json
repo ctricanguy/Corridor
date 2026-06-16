@@ -1,0 +1,8 @@
+[
+  {"date": "2023-01-29", "estimatedEpsAvg": 0.88, "numberAnalystsEstimatedEps": 30, "reportedCurrency": "USD"},
+  {"date": "2025-04-27", "estimatedEpsAvg": 0.90, "numberAnalystsEstimatedEps": 38, "reportedCurrency": "USD"},
+  {"date": "2025-07-27", "estimatedEpsAvg": 1.00, "numberAnalystsEstimatedEps": 40, "reportedCurrency": "USD"},
+  {"date": "2025-10-26", "estimatedEpsAvg": 1.20, "numberAnalystsEstimatedEps": 41, "reportedCurrency": "USD"},
+  {"date": "2026-01-25", "estimatedEpsAvg": null, "numberAnalystsEstimatedEps": 0, "reportedCurrency": "USD"},
+  {"date": "2026-04-26", "estimatedEpsAvg": 1.50, "numberAnalystsEstimatedEps": 35, "reportedCurrency": "USD"}
+]

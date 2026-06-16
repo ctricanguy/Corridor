@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 
 @dataclass(frozen=True)
@@ -25,10 +25,13 @@ class PriceRecord:
     open: float | None
     high: float | None
     low: float | None
-    close: float | None
-    adj_close: float | None
+    close: float | None  # RAW (unadjusted) close — the canonical True P/E numerator
+    adj_close: float | None  # split/dividend adjusted
     volume: int | None
     source: str
+    split_ratio: float = 1.0  # this bar's split (1.0 if none)
+    currency: str = "USD"
+    observation_timestamp: datetime | None = None  # UTC fetch instant
 
 
 @dataclass(frozen=True)
@@ -37,18 +40,24 @@ class ForwardEstimateRecord:
 
     ``as_of_date`` is when this estimate was observed — the field that makes the
     whole series honest. ``source`` distinguishes our accumulation from a paid
-    backfill loaded into the same table.
+    backfill loaded into the same table. Provenance (basis, currency,
+    construction_method) travels with every value and is never anonymous.
     """
 
     ticker: str
     as_of_date: date
     period_type: str  # 'quarter' | 'annual'
-    fiscal_period: str  # '2026Q1' | 'FY2027'
+    fiscal_period: str  # 'FY2026Q1' | 'FY2027'
     period_end_date: date | None
     metric: str  # 'eps' | 'revenue'
     value: float
     num_analysts: int | None
     source: str
+    basis: str = "adjusted_diluted"  # non-GAAP consensus basis
+    currency: str = "USD"
+    construction_method: str = "real_quarterly"
+    is_derived: bool = False
+    observation_timestamp: datetime | None = None  # UTC fetch instant
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,8 @@ class FundamentalRecord:
     unit: str | None
     form: str | None
     source: str
+    basis: str = "gaap_diluted_continuing_ops"  # EDGAR GAAP basis
+    observation_timestamp: datetime | None = None  # UTC fetch instant
 
 
 class PriceSource(ABC):
