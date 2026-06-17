@@ -2,6 +2,7 @@
 # The SQLite DB and Parquet snapshots are local point-in-time state.
 # They are rebuilt/accumulated by the daily refresh job, not version-controlled.
 data/*.db
+data/cik_map.json
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm

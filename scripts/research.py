@@ -21,12 +21,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from corridor.config import get_settings, load_config  # noqa: E402
+from corridor.config import PROJECT_ROOT, get_settings, load_config  # noqa: E402
 from corridor.engine.corridor import TruePePoint, build_corridor  # noqa: E402
 from corridor.engine.peg import forward_peg, ntm_vs_ltm_growth  # noqa: E402
 from corridor.engine.signals import classify_signal, earnings_trend  # noqa: E402
-
-CIK = {"NVDA": "0001045810"}  # minimal map; populate ciks in config for the full watchlist
 
 
 def _m(v):  # money
@@ -103,6 +101,7 @@ def _peg_from(config, ticker, true_pe, ntm_eps, ltm_eps, coverage):
 
 
 def _from_db(ticker, config):
+    from corridor.datasources.cik_resolver import CikResolver
     from corridor.datasources.edgar_source import EdgarFundamentalsSource
     from corridor.db import init_db, session_scope
     from corridor.db.models import ValuationSnapshot
@@ -114,7 +113,8 @@ def _from_db(ticker, config):
     cal = config.fiscal_calendars().get(ticker)
     with session_scope() as s:
         rows = (s.query(ValuationSnapshot)
-                .filter(ValuationSnapshot.ticker == ticker, ValuationSnapshot.true_pe.isnot(None))
+                .filter(ValuationSnapshot.ticker == ticker, ValuationSnapshot.true_pe.isnot(None),
+                        ValuationSnapshot.engine_version == config.engine_version)  # certified only
                 .order_by(ValuationSnapshot.as_of_date).all())
         history = [TruePePoint(r.as_of_date, r.true_pe) for r in rows]
         eps_points = [(r.as_of_date, r.forward_eps_ntm) for r in rows if r.forward_eps_ntm]
@@ -128,11 +128,13 @@ def _from_db(ticker, config):
     trend, detail = earnings_trend(eps_points)
     signal = classify_signal(corridor.pe_percentile, trend, corridor.is_thin,
                              corridor.bands is not None, **sig_params)
-    # LTM from EDGAR for PEG.
+    # LTM from EDGAR for PEG (CIK resolved automatically).
     ltm = None
-    if cal is not None and ticker in CIK:
+    cik = CikResolver(settings.sec_edgar_user_agent,
+                      PROJECT_ROOT / "data" / "cik_map.json").resolve([ticker]).get(ticker)
+    if cal is not None and cik:
         edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent, config.fiscal_calendars())
-        q, a = quarterly_actuals_from_edgar(edgar.get_fundamentals(ticker, cik=CIK[ticker]), cal)
+        q, a = quarterly_actuals_from_edgar(edgar.get_fundamentals(ticker, cik=cik), cal)
         ltm = trailing_ltm_eps(q, a)
     peg = _peg_from(config, ticker, corridor.current_true_pe, latest.forward_eps_ntm, ltm,
                     latest.coverage_score)

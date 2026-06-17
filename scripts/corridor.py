@@ -88,7 +88,8 @@ def _from_db(ticker: str, config) -> Corridor:  # type: ignore[no-untyped-def]
     with session_scope() as s:
         rows = (
             s.query(ValuationSnapshot)
-            .filter(ValuationSnapshot.ticker == ticker, ValuationSnapshot.true_pe.isnot(None))
+            .filter(ValuationSnapshot.ticker == ticker, ValuationSnapshot.true_pe.isnot(None),
+                    ValuationSnapshot.engine_version == config.engine_version)  # certified only
             .order_by(ValuationSnapshot.as_of_date)
             .all()
         )

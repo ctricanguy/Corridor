@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from corridor.config import Config, TickerSpec
-from corridor.datasources.base import ForwardEstimateRecord, PriceRecord
+from corridor.datasources.base import ForwardEstimateRecord, FundamentalRecord, PriceRecord
 from corridor.ingest.job import run_daily
 
 AS_OF = date(2025, 6, 16)
@@ -137,6 +139,34 @@ def test_one_bad_ticker_does_not_abort_the_run(db_url: str) -> None:
     assert statuses["NVDA"] == "ok"  # the good ticker still ran AND persisted
     with session_scope() as s:
         assert s.query(ValuationSnapshot).filter_by(ticker="NVDA").count() == 1
+
+
+def test_cik_enables_actual_subtraction(db_url: str) -> None:
+    # The CIK fix: a resolved CIK -> EDGAR fetched -> reported actual subtracted, so the
+    # stored True P/E is the CERTIFIED number, not the biased annual/4.
+    from corridor.db import session_scope
+    from corridor.db.models import ValuationSnapshot
+
+    seen: dict = {}
+
+    class _Fund:
+        def get_fundamentals(self, ticker: str, cik: str | None = None):
+            seen["cik"] = cik
+            return [FundamentalRecord("NVDA", cik, "FY2026Q1", date(2025, 4, 27), date(2025, 5, 28),
+                    "eps_diluted", 0.80, "USD/shares", "10-Q", "edgar",
+                    source_fiscal_period="FY2026Q1")]
+
+    with session_scope() as s:
+        run_daily(_config(), price_source=_PricesOK(), estimate_source=_Estimates(),
+                  fundamentals_source=_Fund(), session=s, as_of=AS_OF,
+                  cik_by_ticker={"NVDA": "0001045810"})
+    assert seen["cik"] == "0001045810"  # the resolved CIK reached EDGAR
+    with session_scope() as s:
+        true_pe = s.query(ValuationSnapshot).filter_by(ticker="NVDA").one().true_pe
+    # actual 0.80 subtracted: FY2026 Q2/Q3/Q4 = (4.40-0.80)/3, FY2027Q1 = 6.00/4,
+    # sum = 1.20*3 + 1.50 = 5.10 -> 120/5.10 = 23.53 (NOT the old 120/4.80 = 25.0).
+    assert true_pe == pytest.approx(120.0 / 5.10)
+    assert abs(true_pe - 25.0) > 1.0
 
 
 def test_yfinance_retries_on_empty_then_succeeds() -> None:

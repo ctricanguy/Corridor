@@ -134,7 +134,10 @@ data:
   price_crosscheck_source: fmp   # cross-check yfinance price against FMP for the same date
   fundamentals_source: edgar     # trailing/as-reported actuals; backfill is honest here
   # Engine version stamped onto derived valuation rows for reproducibility.
-  engine_version: "0.1.0"
+  # 0.2.0 = CIK resolver wired in: stored True P/E now subtracts EDGAR actuals
+  # (certified path). The corridor reads ONLY rows at this engine_version, so the
+  # pre-fix annual/4 (0.1.0) snapshots can never blend into the history.
+  engine_version: "0.2.0"
   # FMP endpoint config. The API key lives in .env (FMP_API_KEY), never here.
   # NOTE: all three adapters are UNVALIDATED against live endpoints until
   # scripts/validate_live.py has been run with a real key + network.

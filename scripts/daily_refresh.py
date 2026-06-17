@@ -89,6 +89,7 @@ def main() -> int:
 
 
 def _run(settings, api_key, dry_run, fh):  # type: ignore[no-untyped-def]
+    from corridor.datasources.cik_resolver import CikResolver
     from corridor.datasources.edgar_source import EdgarFundamentalsSource
     from corridor.datasources.fmp_source import FMPForwardEstimateSource
     from corridor.datasources.yfinance_source import YFinancePriceSource
@@ -98,6 +99,12 @@ def _run(settings, api_key, dry_run, fh):  # type: ignore[no-untyped-def]
     config = load_config()
     init_db(settings.database_url)  # create schema if missing (run_daily self-seeds securities)
     fmp_cfg = config.data["fmp"]
+
+    # Resolve CIKs watchlist-wide so EDGAR actuals are fetched for EVERY name and the
+    # stored True P/E subtracts reported actuals (the certified path), not annual/4.
+    resolver = CikResolver(settings.sec_edgar_user_agent, PROJECT_ROOT / "data" / "cik_map.json")
+    cik_by_ticker = resolver.resolve(config.tickers)
+    _emit(f"CIKs resolved: {len(cik_by_ticker)}/{len(config.tickers)}", fh)
 
     price_source = YFinancePriceSource()  # retries on zero-bar returns
     estimate_source = FMPForwardEstimateSource(
@@ -112,7 +119,8 @@ def _run(settings, api_key, dry_run, fh):  # type: ignore[no-untyped-def]
     with session_scope() as session:
         results = run_daily(
             config, price_source=price_source, estimate_source=estimate_source,
-            fundamentals_source=fundamentals_source, session=session, dry_run=dry_run,
+            fundamentals_source=fundamentals_source, session=session,
+            cik_by_ticker=cik_by_ticker, dry_run=dry_run,
         )
         for r in results:
             detail = ""

@@ -387,6 +387,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
     session: Session,
     as_of: date | None = None,
     reported_by_ticker: dict[str, dict[str, date]] | None = None,
+    cik_by_ticker: dict[str, str] | None = None,
     dry_run: bool = False,
 ) -> list[PipelineResult]:
     """Fetch + assemble + persist for every supported ticker. Sources are injected.
@@ -415,6 +416,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
     unsupported = config.unsupported_tickers
     align_years = config.alignment_trailing_years
     reported_by_ticker = reported_by_ticker or {}
+    cik_by_ticker = cik_by_ticker or {}
     results: list[PipelineResult] = []
 
     def commit() -> None:
@@ -460,7 +462,8 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
                 continue
 
             cal = cals.get(ticker, FiscalCalendar(fy_end_month=12))
-            fundamentals = _safe_fundamentals(fundamentals_source, ticker, spec.cik)
+            cik = cik_by_ticker.get(ticker) or spec.cik  # resolver wins; config is the fallback
+            fundamentals = _safe_fundamentals(fundamentals_source, ticker, cik)
             edgar_dates, reported_actuals = actuals_from_fundamentals(fundamentals, cal)
             report = check_label_alignment(fundamentals, cal, trailing_years=align_years)
             for la in report.in_window:
