@@ -19,10 +19,10 @@ chart, a forward **PEG** chart, a per-company dashboard, and a watchlist overvie
 | Stage | Scope | State |
 |------:|-------|-------|
 | **0** | Scaffold: repo layout, deps, config, point-in-time schema, `.env.example` | ✅ **this commit** |
-| 1 | Data pipeline: FMP/yfinance/EDGAR adapters, window logic, consistency invariants, sanity gates, actuals loop | ✅ **adapters unvalidated** (see below) |
-| 2 | Valuation engine: True P/E series, bands, signals, forward PEG | ⏳ next |
+| 1 | Data pipeline: FMP/yfinance/EDGAR adapters, window logic, consistency invariants, sanity gates, actuals loop; hardened cron-ready daily job | ✅ validated live (NVDA) |
+| 2 | Valuation engine: True P/E history → percentile-band corridor → buy/trim signals + forward PEG (explicit growth basis) | ✅ engines done; dashboard wiring next |
 | 3 | Overlay: winning-streak study, RSI/MA, earnings flags | ⏳ |
-| 4 | Visualization + memos: the five charts, dashboard, memo generator | ⏳ |
+| 4 | Visualization + memos: the five charts, dashboard, memo generator | ⏳ next |
 | 5 | Validation harness: walk-forward backtest on point-in-time data | ⏳ |
 
 Built in stages with a review pause between each.
