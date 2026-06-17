@@ -45,11 +45,33 @@ def label_period_parts(period_end: date, cal: FiscalCalendar) -> tuple[int, int]
     return fiscal_year, quarter
 
 
+def fiscal_year_of(period_end: date, cal: FiscalCalendar) -> int:
+    """The fiscal-year NUMBER a period-end date belongs to (named by its END year).
+
+    A fiscal year is named for the calendar year in which it ENDS (NVIDIA's year
+    ending Jan 2027 is fiscal 2027). This single date-derived rule is THE source of
+    truth for tying FMP estimates and EDGAR actuals to the same fiscal year — never
+    a provider's label string.
+    """
+    return period_end.year + 1 if period_end.month > cal.fy_end_month else period_end.year
+
+
 def fiscal_year_label(period_end: date, cal: FiscalCalendar) -> str:
-    """Annual label, e.g. 'FY2026', for an annual period-end date."""
-    m = period_end.month
-    fiscal_year = period_end.year + 1 if m > cal.fy_end_month else period_end.year
-    return f"FY{fiscal_year}"
+    """Annual label, e.g. 'FY2026', for an annual period-end date (date-derived)."""
+    return f"FY{fiscal_year_of(period_end, cal)}"
+
+
+def fiscal_year_bounds(fiscal_year: int, cal: FiscalCalendar) -> tuple[date, date]:
+    """Approximate (start, end) calendar dates of a fiscal year.
+
+    end  = the fiscal-year-end (cal month/day in calendar year ``fiscal_year``).
+    start = the day after the prior fiscal-year-end. A few days of 52/53-week drift
+    are immaterial for assigning a quarterly period-end to its fiscal year.
+    """
+    end = _safe_date(fiscal_year, cal.fy_end_month, cal.fy_end_day)
+    prev_end = _safe_date(fiscal_year - 1, cal.fy_end_month, cal.fy_end_day)
+    start = date.fromordinal(prev_end.toordinal() + 1)
+    return start, end
 
 
 def _last_day(year: int, month: int) -> int:

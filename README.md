@@ -145,6 +145,13 @@ with invariants, each backed by an adversarial test:
   `0.0` on this path (every quarter derived) — surfaced honestly, never dressed up
   as per-quarter precision. (Set `fetch_quarterly: true` on a Premium plan to add
   real per-quarter estimates with no engine change.)
+- **Fiscal-year alignment is by DATE, not by label string.** FMP estimates and
+  EDGAR actuals are both keyed to a fiscal year by `period_end` + the company's
+  `FiscalCalendar` (a single date-derived rule), so an actual is subtracted from the
+  *same* fiscal year its date belongs to even if a provider's FY-naming convention
+  is off by one. `check_label_alignment` cross-checks EDGAR's own `fy`/`fp` against
+  the date-derived label and logs any drift (it also catches a wrong `fy_end_month`
+  in config). NVDA's labels agree — verified by test and shown in `validate_live`.
 - **The window.** "Next 4 unreported quarters" is keyed off **confirmed report
   dates** and each company's **own fiscal calendar** (NVDA ends late January, AAPL
   September, AVGO November…), never calendar quarters. It rolls the moment a quarter

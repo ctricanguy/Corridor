@@ -36,10 +36,12 @@ from corridor.datasources.edgar_source import EdgarFundamentalsSource  # noqa: E
 from corridor.datasources.fmp_source import FMPForwardEstimateSource  # noqa: E402
 from corridor.datasources.shape import ShapeMismatch, assert_records_shape  # noqa: E402
 from corridor.datasources.yfinance_source import YFinancePriceSource  # noqa: E402
+from corridor.ingest.fiscal import fiscal_year_bounds, fiscal_year_of  # noqa: E402
 from corridor.ingest.job import (  # noqa: E402
     actuals_from_fundamentals,
     assemble_valuation,
     build_fiscal_periods,
+    check_label_alignment,
 )
 from corridor.ingest.records import PricePoint  # noqa: E402
 
@@ -93,7 +95,8 @@ def main() -> int:  # noqa: C901 - linear top-to-bottom diagnostic
     edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent)
     actuals = edgar.get_fundamentals(TICKER, cik=NVDA_CIK)
     _check_shape("EDGAR actuals", actuals)
-    reported, reported_actuals = actuals_from_fundamentals(actuals)
+    reported, reported_actuals = actuals_from_fundamentals(actuals, cal)
+    _print_fy_alignment(estimates, actuals, cal)  # critical FY-label verification
     periods = build_fiscal_periods(estimates, reported, cal, latest.price_date)
 
     result = assemble_valuation(
@@ -111,6 +114,33 @@ def main() -> int:  # noqa: C901 - linear top-to-bottom diagnostic
 
     _print_breakdown(estimates, reported_actuals, yf_fwd, latest, result)
     return 0 if result.status == "ok" else 1
+
+
+def _print_fy_alignment(estimates: list, edgar_actuals: list, cal: Any) -> None:
+    """Verify FMP and EDGAR refer to the SAME fiscal year — by DATE, not by label."""
+    _hr("0. FISCAL-YEAR ALIGNMENT (by DATE — the critical check)")
+    aligns = check_label_alignment(edgar_actuals, cal)
+    print("  EDGAR quarter   period_end    EDGAR label   date-derived   match?")
+    for a in aligns:
+        mark = "ok" if a.agree else "** DRIFT **"
+        print(f"    {a.period_end}   {a.edgar_label:11}  {a.date_label:11}  {mark}")
+    if aligns and all(a.agree for a in aligns):
+        print("  => EDGAR's FY labels equal our date-derived labels: NO off-by-one.")
+    elif aligns:
+        print("  => Convention DRIFT — but actuals are matched by DATE, so still correct.")
+    else:
+        print("  => No EDGAR quarterly actuals parsed (check CIK / User-Agent).")
+
+    print("\n  Each FMP annual -> the EDGAR actuals inside its fiscal-year DATE bounds:")
+    by_date = [(a.period_end, a.edgar_label) for a in aligns]
+    annuals = [e for e in estimates if e.period_type == "annual" and e.period_end_date]
+    for r in sorted(annuals, key=lambda e: e.period_end_date):
+        fy = fiscal_year_of(r.period_end_date, cal)
+        start, end = fiscal_year_bounds(fy, cal)
+        matched = [lbl for (pe, lbl) in by_date if start <= pe <= end]
+        print(f"    {r.fiscal_period} (end {r.period_end_date}) spans {start}..{end}"
+              f"  -> actuals: {matched or '(none reported yet)'}")
+    _hr()
 
 
 def _print_breakdown(

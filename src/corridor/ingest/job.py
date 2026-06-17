@@ -29,6 +29,7 @@ from ..constants import (
     JOB_DAILY_REFRESH,
     REASON_INCOMPLETE_WINDOW,
     STATUS_OK,
+    STATUS_PARTIAL,
     STATUS_QUARANTINE,
 )
 from ..datasources.base import (
@@ -40,7 +41,7 @@ from ..datasources.base import (
     PriceSource,
 )
 from . import consistency, gates
-from .fiscal import FiscalCalendar, enumerate_fiscal_quarters
+from .fiscal import FiscalCalendar, enumerate_fiscal_quarters, label_period
 from .forward_sum import build_forward_eps_sum
 from .reconcile import ntm_cross_check, quarterly_cross_check, reconcile_prices
 from .records import FiscalPeriod, PricePoint, ValuationInput
@@ -252,27 +253,72 @@ _QUARTER_LABEL = re.compile(r"^FY\d{4}Q[1-4]$")
 
 
 def actuals_from_fundamentals(
-    fundamentals: list[FundamentalRecord],
+    fundamentals: list[FundamentalRecord], cal: FiscalCalendar
 ) -> tuple[dict[str, date], dict[str, float]]:
     """Derive (report_dates, reported_actuals) from EDGAR quarterly fundamentals.
 
-    For each quarterly fiscal period we take the ORIGINALLY-filed record (earliest
-    filed_date) — its filed date is the confirmed report date and its value is the
-    as-reported actual. Both maps come from the same source so the window roll and
-    the derivation divisor never disagree.
+    CRITICAL — labels are keyed by the DATE-derived fiscal period (``label_period``
+    on the EDGAR ``period_end_date``), NOT by EDGAR's own ``fy``/``fp`` label string.
+    FMP estimates and the window are also date-derived, so an actual is subtracted
+    from the SAME fiscal year its date belongs to even if a provider's label-string
+    convention is off by one. ``check_label_alignment`` surfaces any such drift.
+
+    For each fiscal period we take the ORIGINALLY-filed record (earliest filed_date)
+    — its filed date is the confirmed report date and its value is the as-reported
+    actual. Both maps come from the same source so the window roll and the
+    derivation divisor never disagree.
     """
     report_dates: dict[str, date] = {}
     actuals: dict[str, float] = {}
     earliest: dict[str, date] = {}
     for f in fundamentals:
-        if not _QUARTER_LABEL.match(f.fiscal_period) or f.filed_date is None:
+        # Quarter-ness from the as-reported label (a 10-Q entry has a Qn); the KEY
+        # is re-derived from the date so it ties to the FMP annual by date.
+        if "Q" not in f.fiscal_period or f.filed_date is None or f.period_end_date is None:
             continue
-        prev = earliest.get(f.fiscal_period)
+        key = label_period(f.period_end_date, cal)
+        prev = earliest.get(key)
         if prev is None or f.filed_date < prev:
-            earliest[f.fiscal_period] = f.filed_date
-            report_dates[f.fiscal_period] = f.filed_date
-            actuals[f.fiscal_period] = f.value
+            earliest[key] = f.filed_date
+            report_dates[key] = f.filed_date
+            actuals[key] = f.value
     return report_dates, actuals
+
+
+@dataclass(frozen=True)
+class LabelAlignment:
+    """One quarter's EDGAR-reported label vs our date-derived label."""
+
+    period_end: date
+    edgar_label: str  # as filed (EDGAR fy/fp)
+    date_label: str  # derived from period_end + FiscalCalendar
+    agree: bool
+
+
+def check_label_alignment(
+    fundamentals: list[FundamentalRecord], cal: FiscalCalendar
+) -> list[LabelAlignment]:
+    """Compare each EDGAR quarter's filed label to our date-derived label.
+
+    Disagreement means the company's (or provider's) FY-naming convention differs
+    from our FiscalCalendar — which would silently misalign actuals if we matched by
+    label string. We DON'T (we match by date), so this is a verification/warning,
+    and it also catches a wrong ``fy_end_month`` in config.
+    """
+    out: list[LabelAlignment] = []
+    seen: set[str] = set()
+    for f in fundamentals:
+        if "Q" not in f.fiscal_period or f.period_end_date is None:
+            continue
+        if f.fiscal_period in seen:
+            continue
+        seen.add(f.fiscal_period)
+        date_label = label_period(f.period_end_date, cal)
+        out.append(
+            LabelAlignment(f.period_end_date, f.fiscal_period, date_label,
+                           f.fiscal_period == date_label)
+        )
+    return sorted(out, key=lambda a: a.period_end)
 
 
 # --- persistence ------------------------------------------------------------
@@ -335,9 +381,16 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
 
             # EDGAR actuals give BOTH the confirmed report dates (for the window) and
             # the reported quarterly EPS values (for split-from-annual derivation).
-            fundamentals = _safe_fundamentals(fundamentals_source, ticker, spec.cik)
-            edgar_dates, reported_actuals = actuals_from_fundamentals(fundamentals)
             cal = cals.get(ticker, FiscalCalendar(fy_end_month=12))
+            fundamentals = _safe_fundamentals(fundamentals_source, ticker, spec.cik)
+            edgar_dates, reported_actuals = actuals_from_fundamentals(fundamentals, cal)
+            for la in check_label_alignment(fundamentals, cal):
+                if not la.agree:  # surfaced, never silent — matching still ties by date
+                    logger.warning("%s FY-label drift: EDGAR %s vs date-derived %s (end %s)",
+                                   ticker, la.edgar_label, la.date_label, la.period_end)
+                    _log(session, IngestionLog, ticker, STATUS_PARTIAL,
+                         f"FY-label drift EDGAR {la.edgar_label} vs date {la.date_label} "
+                         f"@ {la.period_end} (matched by date)", None)
             reported = reported_by_ticker.get(ticker) or edgar_dates
             periods = build_fiscal_periods(estimates, reported, cal, as_of)
             crosscheck = _safe_fmp_price(estimate_source, ticker, as_of)
