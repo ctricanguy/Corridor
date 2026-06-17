@@ -87,6 +87,36 @@ def test_assemble_annual_only_path_v1() -> None:
     assert not v.quarterly_xcheck_flag
 
 
+def test_yfinance_is_flag_only_never_blended_into_the_sum() -> None:
+    """v1 DECISION lock: FLAT derivation for the sum; yfinance is an INDEPENDENT
+    cross-check flag only. Changing the yfinance next-quarter value must NOT move the
+    forward sum or True P/E — only the cross-check fields. This guards against a
+    future change silently blending yfinance into the derivation."""
+    annual = [
+        ForwardEstimateRecord("NVDA", AS_OF, "annual", "FY2026", date(2026, 1, 25),
+                              "eps", 4.40, 40, "fmp"),
+        ForwardEstimateRecord("NVDA", AS_OF, "annual", "FY2027", date(2027, 1, 31),
+                              "eps", 6.00, 40, "fmp"),
+    ]
+    common = {
+        "ticker": "NVDA", "as_of": AS_OF, "price_point": _point(), "report_currency": "USD",
+        "estimate_records": annual, "fiscal_periods": PERIODS,
+        "reported_actuals": {"FY2026Q1": 0.80},
+    }
+    # Derived next quarter is flat (4.40-0.80)/3 = 1.20, independent of yfinance.
+    no_flag = assemble_valuation(**common, yf_next_quarter_eps=1.15)  # ~4% -> no flag
+    flagged = assemble_valuation(**common, yf_next_quarter_eps=2.00)  # ~40% -> flag
+
+    # Sum + True P/E are IDENTICAL regardless of the yfinance value (flat, not blended).
+    assert no_flag.valuation.forward_eps_sum == pytest.approx(5.10)
+    assert flagged.valuation.forward_eps_sum == pytest.approx(5.10)
+    assert no_flag.valuation.true_pe == flagged.valuation.true_pe
+    # Only the cross-check reflects yfinance.
+    assert no_flag.valuation.yf_next_q_eps == pytest.approx(1.15)
+    assert not no_flag.valuation.quarterly_xcheck_flag
+    assert flagged.valuation.quarterly_xcheck_flag
+
+
 def test_assemble_rejects_adr_currency_mismatch() -> None:
     # Report currency TWD vs USD price -> unsupported, never a naive P/E.
     r = assemble_valuation(

@@ -1,5 +1,15 @@
 """Compare forward-quarter derivation methods (ANALYSIS ONLY — not used by the engine).
 
+v1 DECISION (adopted): FLAT is the production derivation; yfinance stays an
+INDEPENDENT cross-check flag and is NOT blended into the sum; (a) blend and (b)
+seasonality are REJECTED for v1. Rationale: within a fiscal year the unreported
+quarters must sum to (annual − reported actuals), so flat and (a) yield the SAME
+forward sum / True P/E — the number is already anchored by real annual consensus —
+and (b) moves it only via a far next-FY quarter using historical shares distorted by
+NVDA's ramp (complexity on the weakest data). This module is kept as the evaluation
+record; re-run scripts/compare_derivation.py if growth matures and seasonality
+becomes a clean proxy.
+
 Three ways to turn the FMP multi-year ANNUAL curve into the next-4 forward quarters:
 
   * ``flat``        — current production: split the (annual − reported actuals)

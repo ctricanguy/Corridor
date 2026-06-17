@@ -145,6 +145,14 @@ with invariants, each backed by an adversarial test:
   `0.0` on this path (every quarter derived) — surfaced honestly, never dressed up
   as per-quarter precision. (Set `fetch_quarterly: true` on a Premium plan to add
   real per-quarter estimates with no engine change.)
+- **Derivation method — v1 decision: FLAT even-spread.** Evaluated flat vs (a)
+  yfinance-blended near quarters vs (b) seasonality weighting (`scripts/compare_derivation.py`,
+  analysis-only). Adopted **flat**: within a fiscal year the unreported quarters must
+  sum to `annual − reported actuals`, so flat and (a) give the *same* forward
+  sum/True P/E (the number is anchored by real annual consensus — (a) only zeroes the
+  per-quarter cross-check by construction), and (b) moves it only via a far next-FY
+  quarter using historical shares distorted by NVDA's ramp. **yfinance stays an
+  independent cross-check flag, never blended into the sum** (guarded by a test).
 - **Fiscal-year alignment is by DATE, not by label string.** FMP estimates and
   EDGAR actuals are both keyed to a fiscal year by `period_end` + the company's
   `FiscalCalendar` (a single date-derived rule), so an actual is subtracted from the
