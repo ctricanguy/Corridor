@@ -1,0 +1,159 @@
+"""Daily-job hardening: self-seeding (FK), price gaps, dry-run, resilience, retry.
+
+These reproduce the two bugs from the first unattended Pi run — FK rejection on a
+fresh DB, and yfinance returning zero bars — and lock in the fixes.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+from corridor.config import Config, TickerSpec
+from corridor.datasources.base import ForwardEstimateRecord, PriceRecord
+from corridor.ingest.job import run_daily
+
+AS_OF = date(2025, 6, 16)
+
+
+def _annual(ticker: str = "NVDA") -> list[ForwardEstimateRecord]:
+    return [
+        ForwardEstimateRecord(ticker, AS_OF, "annual", "FY2026", date(2026, 1, 25),
+                              "eps", 4.40, 40, "fmp"),
+        ForwardEstimateRecord(ticker, AS_OF, "annual", "FY2027", date(2027, 1, 31),
+                              "eps", 6.00, 40, "fmp"),
+    ]
+
+
+class _Estimates:
+    def get_forward_estimates(self, ticker: str, as_of: date | None = None):
+        return _annual(ticker)
+
+
+class _PricesOK:
+    def get_prices(self, ticker: str, start: date | None = None):
+        return [PriceRecord(ticker, AS_OF, 120.0, 121.0, 119.0, 120.0, 120.0, 1_000, "yfinance")]
+
+
+class _PricesEmpty:
+    """Simulates yfinance returning ZERO bars (the GOOGL/AMD case)."""
+
+    def get_prices(self, ticker: str, start: date | None = None):
+        return []
+
+
+class _NoFundamentals:
+    def get_fundamentals(self, ticker: str, cik: str | None = None):
+        return []
+
+
+def _config(universe=None) -> Config:  # type: ignore[no-untyped-def]
+    return Config(
+        universe=universe or [TickerSpec("NVDA", "NVIDIA", cik="1045810")],
+        data={"engine_version": "0.1.0",
+              "fiscal_calendars": {"NVDA": {"fy_end_month": 1, "fy_end_day": 31}}},
+    )
+
+
+def _run(session, *, prices=None, estimates=None, config=None, dry_run=False):  # type: ignore[no-untyped-def]
+    return run_daily(
+        config or _config(), price_source=prices or _PricesOK(),
+        estimate_source=estimates or _Estimates(), fundamentals_source=_NoFundamentals(),
+        session=session, as_of=AS_OF, dry_run=dry_run,
+    )
+
+
+def test_run_daily_self_seeds_securities_on_fresh_db(db_url: str) -> None:
+    # Bug 1: the schema exists but NO securities are seeded. run_daily must upsert the
+    # parent row itself, so child inserts are NOT FK-rejected.
+    from corridor.db import session_scope
+    from corridor.db.models import (
+        ForwardEstimateSnapshot,
+        PriceSnapshot,
+        Security,
+        ValuationSnapshot,
+    )
+
+    with session_scope() as s:
+        assert s.query(Security).count() == 0  # genuinely empty
+    with session_scope() as s:
+        results = _run(s)
+    assert results[0].status == "ok"
+    with session_scope() as s:
+        assert s.query(Security).filter_by(ticker="NVDA").one_or_none() is not None
+        assert s.query(ForwardEstimateSnapshot).count() > 0  # NOT FK-rejected
+        assert s.query(PriceSnapshot).count() == 1
+        assert s.query(ValuationSnapshot).count() == 1
+
+
+def test_price_gap_writes_estimates_but_no_valuation(db_url: str) -> None:
+    # Bug 2: zero price bars -> log a price gap, write estimates, skip price-dependent rows.
+    from corridor.db import session_scope
+    from corridor.db.models import (
+        ForwardEstimateSnapshot,
+        IngestionLog,
+        PriceSnapshot,
+        ValuationSnapshot,
+    )
+
+    with session_scope() as s:
+        results = _run(s, prices=_PricesEmpty())
+    assert results[0].status == "price_gap"
+    with session_scope() as s:
+        assert s.query(ForwardEstimateSnapshot).count() > 0  # estimates STILL written
+        assert s.query(PriceSnapshot).count() == 0  # no price row from a zero-bar return
+        assert s.query(ValuationSnapshot).count() == 0  # no True P/E without a price
+        gap = s.query(IngestionLog).filter_by(reason_code="price_gap_no_bars").one_or_none()
+        assert gap is not None and gap.status == "missing"
+
+
+def test_dry_run_writes_nothing(db_url: str) -> None:
+    from corridor.db import session_scope
+    from corridor.db.models import ForwardEstimateSnapshot, IngestionLog, ValuationSnapshot
+
+    with session_scope() as s:
+        results = _run(s, dry_run=True)
+    assert results[0].status == "ok"  # computed...
+    with session_scope() as s:
+        assert s.query(ForwardEstimateSnapshot).count() == 0  # ...but nothing persisted
+        assert s.query(ValuationSnapshot).count() == 0
+        assert s.query(IngestionLog).count() == 0
+
+
+def test_one_bad_ticker_does_not_abort_the_run(db_url: str) -> None:
+    from corridor.db import session_scope
+    from corridor.db.models import ValuationSnapshot
+
+    class _Boom:
+        def get_forward_estimates(self, ticker: str, as_of: date | None = None):
+            if ticker == "BAD":
+                raise RuntimeError("network blip")
+            return _annual(ticker)
+
+    cfg = _config(universe=[TickerSpec("BAD", "Bad"), TickerSpec("NVDA", "NVIDIA", cik="1045810")])
+    with session_scope() as s:
+        results = _run(s, estimates=_Boom(), config=cfg)
+    statuses = {r.ticker: r.status for r in results}
+    assert statuses["BAD"] == "error"
+    assert statuses["NVDA"] == "ok"  # the good ticker still ran AND persisted
+    with session_scope() as s:
+        assert s.query(ValuationSnapshot).filter_by(ticker="NVDA").count() == 1
+
+
+def test_yfinance_retries_on_empty_then_succeeds() -> None:
+    from corridor.datasources.yfinance_source import YFinancePriceSource
+
+    src = YFinancePriceSource(retries=2, backoff_sec=0.0)  # no real sleep
+    calls = {"n": 0}
+
+    def fake_fetch(ticker: str, start):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return [], {}, "USD"  # empty twice (yfinance flakiness)
+        rows = [{"date": AS_OF, "open": 1.0, "high": 1.0, "low": 1.0,
+                 "close": 120.0, "adj_close": 120.0, "volume": 1}]
+        return rows, {}, "USD"
+
+    src._fetch = fake_fetch  # type: ignore[method-assign]
+    recs = src.get_prices("NVDA")
+    assert calls["n"] == 3  # retried until data arrived
+    assert len(recs) == 1 and recs[0].close == 120.0

@@ -210,10 +210,7 @@ def test_run_daily_writes_clean_row_quarantines_adr_and_is_idempotent(db_url: st
         ValuationSnapshot,
     )
 
-    with session_scope() as s:
-        s.add(Security(ticker="NVDA", name="NVIDIA"))
-        s.add(Security(ticker="TSM", name="TSMC"))
-
+    # NOTE: securities are NOT pre-seeded — run_daily must upsert the parent rows.
     with session_scope() as s:
         results = _run(s)
     statuses = {r.ticker: r.status for r in results}
@@ -221,6 +218,7 @@ def test_run_daily_writes_clean_row_quarantines_adr_and_is_idempotent(db_url: st
     assert statuses["TSM"] == "unsupported"  # never fetched, hard-rejected
 
     with session_scope() as s:
+        assert s.query(Security).filter_by(ticker="NVDA").one_or_none() is not None  # self-seeded
         vals = s.query(ValuationSnapshot).all()
         assert len(vals) == 1
         # EDGAR FY2026Q1 actual (0.80) flows through: FY2026Q4 = (4.40-0.80-2.20)/1 = 1.40,

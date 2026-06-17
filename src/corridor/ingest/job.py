@@ -27,8 +27,12 @@ from typing import TYPE_CHECKING, Any
 from ..constants import (
     EPS_BASIS_ADJUSTED_DILUTED,
     JOB_DAILY_REFRESH,
+    REASON_CURRENCY_MISMATCH,
     REASON_INCOMPLETE_WINDOW,
+    REASON_NO_ESTIMATES,
+    REASON_PRICE_GAP,
     STATUS_ERROR,
+    STATUS_MISSING,
     STATUS_OK,
     STATUS_PARTIAL,
     STATUS_QUARANTINE,
@@ -383,14 +387,27 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
     session: Session,
     as_of: date | None = None,
     reported_by_ticker: dict[str, dict[str, date]] | None = None,
+    dry_run: bool = False,
 ) -> list[PipelineResult]:
     """Fetch + assemble + persist for every supported ticker. Sources are injected.
 
-    Every ticker ends in ingestion_log (ok|quarantine|unsupported|incomplete|error);
-    no silent gaps. Clean rows write valuation_snapshots; raw estimates/prices write
-    their immutable tables idempotently; quarantines write only ingestion_log.
+    SELF-SUFFICIENT: upserts each parent ``securities`` row before any child snapshot,
+    so it works on a fresh DB without separate seeding. RESILIENT: each ticker is
+    isolated and committed on its own — one failing ticker rolls back only its own
+    writes and the run continues. IDEMPOTENT: insert-or-ignore on the natural keys, so
+    a re-run (or a retry after partial failure) never duplicates or trips the
+    immutability triggers. Every ticker ends in ingestion_log; no silent gaps.
+
+    Forward estimates are written even when the price is missing (a yfinance gap skips
+    only the ticker's price-dependent rows). With ``dry_run`` nothing is committed.
     """
-    from ..db.models import ForwardEstimateSnapshot, IngestionLog, PriceSnapshot, ValuationSnapshot
+    from ..db.models import (
+        ForwardEstimateSnapshot,
+        IngestionLog,
+        PriceSnapshot,
+        Security,
+        ValuationSnapshot,
+    )
 
     as_of = as_of or datetime.now(UTC).date()
     cals = config.fiscal_calendars()
@@ -400,26 +417,48 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
     reported_by_ticker = reported_by_ticker or {}
     results: list[PipelineResult] = []
 
+    def commit() -> None:
+        if not dry_run:
+            session.commit()
+
     for spec in config.universe:
         ticker = spec.ticker
         try:
             if ticker in unsupported:
                 _log(session, IngestionLog, ticker, STATUS_QUARANTINE,
-                     "configured unsupported (foreign/ADR)", "currency_mismatch_unsupported_v1")
+                     "configured unsupported (foreign/ADR)", REASON_CURRENCY_MISMATCH)
                 results.append(PipelineResult(ticker, as_of, "unsupported"))
+                commit()
                 continue
 
-            prices = price_source.get_prices(ticker, start=as_of)
-            price_rec = _price_on(prices, as_of)
             estimates = estimate_source.get_forward_estimates(ticker, as_of=as_of)
-            if price_rec is None or not estimates:
-                _log(session, IngestionLog, ticker, "missing",
-                     f"price={'ok' if price_rec else 'MISSING'} estimates={len(estimates)}", None)
-                results.append(PipelineResult(ticker, as_of, "error", detail="missing inputs"))
+            if not estimates:
+                _log(session, IngestionLog, ticker, STATUS_MISSING,
+                     "no forward estimates returned", REASON_NO_ESTIMATES)
+                results.append(PipelineResult(ticker, as_of, "error", detail="no estimates"))
+                commit()
                 continue
 
-            # EDGAR actuals give BOTH the confirmed report dates (for the window) and
-            # the reported quarterly EPS values (for split-from-annual derivation).
+            # PARENT security row BEFORE any child snapshot (fixes FK rejection on a
+            # fresh DB). Forward estimates are price-independent -> always written.
+            _insert_or_ignore(session, Security,
+                              {"ticker": ticker, "name": spec.name, "cik": spec.cik}, ["ticker"])
+            for r in estimates:
+                _insert_or_ignore(session, ForwardEstimateSnapshot, _fwd_row(r),
+                                  ["ticker", "as_of_date", "fiscal_period", "metric", "source"])
+
+            # Price (retried inside the adapter). Zero bars -> price gap: log it, skip
+            # only the price-dependent rows; the estimates above are already written.
+            price_rec = _price_on(price_source.get_prices(ticker, start=as_of), as_of)
+            if price_rec is None:
+                _log(session, IngestionLog, ticker, STATUS_MISSING,
+                     f"no price bar for {as_of}; {len(estimates)} forward estimates written",
+                     REASON_PRICE_GAP)
+                results.append(PipelineResult(ticker, as_of, "price_gap",
+                                              detail="no price bars (estimates written)"))
+                commit()
+                continue
+
             cal = cals.get(ticker, FiscalCalendar(fy_end_month=12))
             fundamentals = _safe_fundamentals(fundamentals_source, ticker, spec.cik)
             edgar_dates, reported_actuals = actuals_from_fundamentals(fundamentals, cal)
@@ -441,41 +480,38 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
             yf_next_q = _safe_yf_next_q(price_source, ticker)
 
             result = assemble_valuation(
-                ticker=ticker,
-                as_of=as_of,
-                price_point=_to_point(price_rec),
-                report_currency=estimates[0].currency,
-                estimate_records=estimates,
-                fiscal_periods=periods,
-                reported_actuals=reported_actuals,
-                crosscheck_price_fmp=crosscheck,
-                yf_next_quarter_eps=yf_next_q,
+                ticker=ticker, as_of=as_of, price_point=_to_point(price_rec),
+                report_currency=estimates[0].currency, estimate_records=estimates,
+                fiscal_periods=periods, reported_actuals=reported_actuals,
+                crosscheck_price_fmp=crosscheck, yf_next_quarter_eps=yf_next_q,
                 thresholds=thresholds,
             )
 
-            # Persist raw immutable snapshots (idempotent) regardless of outcome.
-            for r in estimates:
-                _insert_or_ignore(session, ForwardEstimateSnapshot, _fwd_row(r),
-                                  ["ticker", "as_of_date", "fiscal_period", "metric", "source"])
             _insert_or_ignore(session, PriceSnapshot, _price_row(price_rec),
                               ["ticker", "price_date", "source"])
-
             if result.is_clean and result.valuation is not None:
-                valuation = result.valuation
                 _insert_or_ignore(session, ValuationSnapshot,
-                                  _val_row(valuation, config.engine_version),
+                                  _val_row(result.valuation, config.engine_version),
                                   ["ticker", "as_of_date", "engine_version"])
                 _log(session, IngestionLog, ticker, STATUS_OK,
-                     valuation.construction_method, None, rows_written=1)
+                     result.valuation.construction_method, None, rows_written=1)
             else:
                 _log(session, IngestionLog, ticker, STATUS_QUARANTINE,
                      result.detail, result.reason_code)
             results.append(result)
-        except Exception as exc:  # no silent failures
+            commit()
+        except Exception as exc:  # one bad ticker must not abort the run
             logger.exception("daily_refresh failed for %s", ticker)
-            _log(session, IngestionLog, ticker, "error", str(exc), None)
-            results.append(PipelineResult(ticker, as_of, "error", detail=str(exc)))
-    session.commit()
+            session.rollback()  # undo THIS ticker only; prior tickers are already committed
+            try:
+                _log(session, IngestionLog, ticker, STATUS_ERROR, str(exc)[:500], None)
+                commit()
+            except Exception:
+                session.rollback()
+            results.append(PipelineResult(ticker, as_of, "error", detail=str(exc)[:200]))
+
+    if dry_run:
+        session.rollback()
     return results
 
 

@@ -29,6 +29,12 @@ class YFinancePriceSource(PriceSource):
     name = "yfinance"
     validated = False
 
+    def __init__(self, retries: int = 2, backoff_sec: float = 1.5) -> None:
+        # yfinance's scraper is flaky and intermittently returns ZERO bars; retry a
+        # couple of times with a short backoff before declaring a price gap.
+        self.retries = retries
+        self.backoff_sec = backoff_sec
+
     # --- network (untested here) ---------------------------------------------
     def _fetch(
         self, ticker: str, start: date | None
@@ -63,7 +69,30 @@ class YFinancePriceSource(PriceSource):
         return rows, splits, currency
 
     def get_prices(self, ticker: str, start: date | None = None) -> list[PriceRecord]:
-        rows, splits, currency = self._fetch(ticker, start)
+        """Fetch price bars, RETRYING on a zero-bar return (yfinance flakiness).
+
+        Never raises and never silently returns a bad bar: after exhausting retries it
+        returns ``[]`` (which the daily job records as a price gap and skips the
+        ticker's price-dependent rows — the forward estimates are still written).
+        """
+        import time
+
+        rows: list[dict[str, Any]] = []
+        splits: dict[date, float] = {}
+        currency = "USD"
+        for attempt in range(self.retries + 1):
+            try:
+                rows, splits, currency = self._fetch(ticker, start)
+            except Exception as exc:  # network blip / scraper error
+                logger.warning("%s: yfinance fetch error (attempt %d/%d): %s",
+                               ticker, attempt + 1, self.retries + 1, exc)
+                rows = []
+            if rows:
+                break
+            if attempt < self.retries:
+                logger.warning("%s: yfinance returned 0 price bars (attempt %d/%d); retrying",
+                               ticker, attempt + 1, self.retries + 1)
+                time.sleep(self.backoff_sec * (attempt + 1))
         return self.parse_history(rows, splits, ticker, currency)
 
     # --- parsing (pure; unit-tested against fixtures) ------------------------

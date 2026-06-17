@@ -12,6 +12,9 @@ data/snapshots/
 .env
 .env.local
 
+# Unattended run logs
+logs/
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

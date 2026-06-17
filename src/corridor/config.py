@@ -41,11 +41,26 @@ class Settings:
         return self.snapshot_dir
 
 
+def _resolve_sqlite_url(url: str) -> str:
+    """Make a RELATIVE sqlite path absolute (anchored at the project root).
+
+    Critical for unattended cron: cron runs from a different working directory, so a
+    relative 'sqlite:///data/corridor.db' would point at the wrong file. An absolute
+    URL or a non-sqlite backend is returned unchanged.
+    """
+    prefix = "sqlite:///"
+    if url.startswith(prefix):
+        path = url[len(prefix):]
+        if path and not Path(path).is_absolute():
+            return f"{prefix}{(PROJECT_ROOT / path).resolve()}"
+    return url
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Load environment settings once (cached). Reads .env if present."""
     load_dotenv(PROJECT_ROOT / ".env")
-    database_url = os.getenv("CORRIDOR_DATABASE_URL", "sqlite:///data/corridor.db")
+    database_url = _resolve_sqlite_url(os.getenv("CORRIDOR_DATABASE_URL", "sqlite:///data/corridor.db"))
     snapshot_dir = Path(os.getenv("CORRIDOR_SNAPSHOT_DIR", "data/snapshots"))
     if not snapshot_dir.is_absolute():
         snapshot_dir = PROJECT_ROOT / snapshot_dir

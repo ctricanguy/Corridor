@@ -31,6 +31,8 @@ REASON_TRUE_PE_JUMP = "true_pe_jump_no_split"
 REASON_CURRENCY_MISMATCH = "currency_mismatch_unsupported_v1"
 REASON_TIME_MISALIGNMENT = "price_estimate_date_mismatch"
 REASON_INCOMPLETE_WINDOW = "incomplete_forward_window"
+REASON_PRICE_GAP = "price_gap_no_bars"  # yfinance returned zero bars for the date
+REASON_NO_ESTIMATES = "no_forward_estimates"
 
 # --- Jobs ---
 JOB_DAILY_REFRESH = "daily_refresh"
