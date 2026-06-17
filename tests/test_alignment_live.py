@@ -36,13 +36,24 @@ def test_nvda_fiscal_labels_align_on_live_edgar() -> None:
     edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent, config.fiscal_calendars())
     actuals = edgar.get_fundamentals("NVDA", cik=NVDA_CIK)
 
-    aligns = check_label_alignment(actuals, cal)
-    assert aligns, "no EDGAR quarterly actuals parsed for NVDA"
-    drift = [(a.period_end, a.edgar_label, a.date_label) for a in aligns if not a.agree]
-    assert not drift, f"FY-label drift on LIVE EDGAR (gate would read aligned=False): {drift}"
+    report = check_label_alignment(actuals, cal)
+    assert report.in_window, "no in-window EDGAR quarters parsed for NVDA"
 
-    # NVIDIA convention: a quarter ending in April of year Y is Q1 of fiscal year Y+1.
-    april = [a for a in aligns if a.period_end.month == 4]
-    assert april, "expected at least one April (Q1) quarter in NVDA's EDGAR history"
-    for a in april:
-        assert a.date_label == f"FY{a.period_end.year + 1}Q1"
+    # The GATE: every quarter inside the trailing window must align (no drift).
+    drift = [(a.period_end, a.edgar_label, a.date_label) for a in report.in_window if not a.agree]
+    assert not drift, (
+        f"FY-label drift INSIDE the gate window FY{report.window_start_fy}-FY{report.anchor_fy}: "
+        f"{drift}"
+    )
+    # Older drift is EXPECTED (NVIDIA's pre-2023 period boundaries shifted) — report,
+    # don't fail.
+    older_drift = [(a.period_end, a.edgar_label, a.date_label) for a in report.older if not a.agree]
+    if older_drift:
+        print(f"\n[info] {len(older_drift)} older quarters exempt from the gate "
+              f"(pre-FY{report.window_start_fy}); e.g. {older_drift[:3]}")
+
+    # NVIDIA convention spot-check, within the gate window: an April quarter of year
+    # Y is Q1 of fiscal year Y+1.
+    for a in report.in_window:
+        if a.period_end.month == 4:
+            assert a.date_label == f"FY{a.period_end.year + 1}Q1"

@@ -149,6 +149,13 @@ data:
     estimates_page_limit: 10          # Starter cap; adapter pages through if needed
     fetch_quarterly: false            # Premium only — true per-quarter estimates
 
+  # FY-label alignment gate scope: the forward sum only consumes the current fiscal
+  # year's actuals, so the gate CERTIFIES a trailing window of this many fiscal years
+  # (in-window quarters must align). Older quarters are exempt + logged, not gated
+  # (NVIDIA's pre-2023 52/53-week period boundaries shifted; old labels can't be
+  # date-derived with one fixed calendar, and the forward sum never uses them).
+  alignment_gate_trailing_years: 3
+
   # Reconciliation / sanity thresholds (each one is exercised by a test).
   thresholds:
     ntm_divergence_pct: 0.10      # strict 4Q sum vs provider-native NTM -> flag

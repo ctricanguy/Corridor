@@ -110,22 +110,27 @@ def main() -> int:  # noqa: C901 - linear diagnostic
 
     reported_dates, reported_actuals = actuals_from_fundamentals(actuals, cal)
 
-    # --- 1. ALIGNMENT FIRST -------------------------------------------------
+    # --- 1. ALIGNMENT FIRST (gate SCOPED to the forward-sum window) ----------
     _hr("1. FISCAL-YEAR ALIGNMENT (by DATE — gate for the whole study)")
-    aligns = check_label_alignment(actuals, cal)
-    for a in aligns[-6:]:
+    report = check_label_alignment(actuals, cal, trailing_years=config.alignment_trailing_years)
+    if report.window_start_fy is not None:
+        print(f"   gate window: FY{report.window_start_fy}-FY{report.anchor_fy} "
+              f"(trailing {report.trailing_years} fiscal years)")
+    for a in report.in_window:  # SAME range the verdict uses (no more contradiction)
         print(f"   {a.period_end}  EDGAR {a.edgar_label:10} vs date {a.date_label:10}  "
               f"{'ok' if a.agree else '** DRIFT **'}")
-    aligned = bool(aligns) and all(a.agree for a in aligns)
-    print(f"   => aligned: {aligned}" + ("" if aligned else "  (comparison UNTRUSTWORTHY)"))
+    print(f"   => aligned: {report.aligned}"
+          + ("" if report.aligned else "  (comparison UNTRUSTWORTHY)"))
+    if report.older:
+        print(f"   older quarters: {len(report.older)} exempt ({len(report.older_drift)} drift), "
+              f"pre-FY{report.window_start_fy} — logged, not gated (forward sum never uses them)")
+    in_window_ends = {a.period_end for a in report.in_window}
     annual_ests = [e for e in estimates if e.period_type == "annual" and e.period_end_date]
     for r in sorted(annual_ests, key=lambda e: e.period_end_date)[:3]:
         fy = fiscal_year_of(r.period_end_date, cal)
         start, end = fiscal_year_bounds(fy, cal)
         inside = sorted({
-            label_period_parts(f.period_end_date, cal)[1]
-            for f in actuals
-            if "Q" in f.fiscal_period and f.period_end_date and start <= f.period_end_date <= end
+            label_period_parts(pe, cal)[1] for pe in in_window_ends if start <= pe <= end
         })
         print(f"   FMP {r.fiscal_period} (end {r.period_end_date}) spans {start}..{end}"
               f"  -> EDGAR Q's inside: {inside or '(none)'}")

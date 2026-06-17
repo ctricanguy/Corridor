@@ -101,6 +101,11 @@ class Config:
         return {**defaults, **self.data.get("thresholds", {})}
 
     @property
+    def alignment_trailing_years(self) -> int:
+        """Trailing fiscal-year window the FY-label gate certifies (older = exempt)."""
+        return int(self.data.get("alignment_gate_trailing_years", 3))
+
+    @property
     def unsupported_tickers(self) -> set[str]:
         """Tickers excluded from v1 (foreign/ADR). Currency guard enforces this too."""
         return {str(item["ticker"]).upper() for item in self.unsupported if "ticker" in item}

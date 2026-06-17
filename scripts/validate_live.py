@@ -96,7 +96,7 @@ def main() -> int:  # noqa: C901 - linear top-to-bottom diagnostic
     actuals = edgar.get_fundamentals(TICKER, cik=NVDA_CIK)
     _check_shape("EDGAR actuals", actuals)
     reported, reported_actuals = actuals_from_fundamentals(actuals, cal)
-    _print_fy_alignment(estimates, actuals, cal)  # critical FY-label verification
+    _print_fy_alignment(estimates, actuals, cal, config.alignment_trailing_years)
     periods = build_fiscal_periods(estimates, reported, cal, latest.price_date)
 
     result = assemble_valuation(
@@ -116,23 +116,27 @@ def main() -> int:  # noqa: C901 - linear top-to-bottom diagnostic
     return 0 if result.status == "ok" else 1
 
 
-def _print_fy_alignment(estimates: list, edgar_actuals: list, cal: Any) -> None:
-    """Verify FMP and EDGAR refer to the SAME fiscal year — by DATE, not by label."""
-    _hr("0. FISCAL-YEAR ALIGNMENT (by DATE — the critical check)")
-    aligns = check_label_alignment(edgar_actuals, cal)
-    print("  EDGAR quarter   period_end    EDGAR label   date-derived   match?")
-    for a in aligns:
-        mark = "ok" if a.agree else "** DRIFT **"
-        print(f"    {a.period_end}   {a.edgar_label:11}  {a.date_label:11}  {mark}")
-    if aligns and all(a.agree for a in aligns):
-        print("  => EDGAR's FY labels equal our date-derived labels: NO off-by-one.")
-    elif aligns:
-        print("  => Convention DRIFT — but actuals are matched by DATE, so still correct.")
-    else:
-        print("  => No EDGAR quarterly actuals parsed (check CIK / User-Agent).")
+def _print_fy_alignment(
+    estimates: list, edgar_actuals: list, cal: Any, trailing_years: int
+) -> None:
+    """Verify FMP and EDGAR refer to the SAME fiscal year — by DATE, scoped to the
+    trailing window the forward sum consumes. Display and verdict use the SAME range."""
+    _hr("0. FISCAL-YEAR ALIGNMENT (by DATE — gate scoped to the forward-sum window)")
+    report = check_label_alignment(edgar_actuals, cal, trailing_years)
+    if report.window_start_fy is not None:
+        print(f"  gate window: FY{report.window_start_fy}-FY{report.anchor_fy} "
+              f"(trailing {report.trailing_years} fiscal years)")
+    print("  period_end    EDGAR label   date-derived   match?")
+    for a in report.in_window:
+        print(f"    {a.period_end}   {a.edgar_label:11}  {a.date_label:11}  "
+              f"{'ok' if a.agree else '** DRIFT **'}")
+    print(f"  => aligned: {report.aligned}   (verdict over the gate window above)")
+    if report.older:
+        print(f"  older quarters: {len(report.older)} exempt ({len(report.older_drift)} with "
+              f"boundary drift), pre-FY{report.window_start_fy} — logged, not gated")
 
     print("\n  Each FMP annual -> the EDGAR actuals inside its fiscal-year DATE bounds:")
-    by_date = [(a.period_end, a.edgar_label) for a in aligns]
+    by_date = [(a.period_end, a.edgar_label) for a in report.in_window]
     annuals = [e for e in estimates if e.period_type == "annual" and e.period_end_date]
     for r in sorted(annuals, key=lambda e: e.period_end_date):
         fy = fiscal_year_of(r.period_end_date, cal)

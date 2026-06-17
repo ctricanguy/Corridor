@@ -52,11 +52,11 @@ def test_original_and_comparative_align_via_earliest_filed() -> None:
     # The live case: original (fy=2026) + comparative (fy=2027, filed a year later).
     original = _q1_fy2026("FY2026Q1", filed=date(2025, 5, 28))
     comparative = _q1_fy2026("FY2027Q1", filed=date(2026, 5, 28))  # drifted +1yr
-    aligns = check_label_alignment([comparative, original], NVDA_CAL)
-    assert len(aligns) == 1
-    assert aligns[0].agree  # anchored to the ORIGINAL -> aligned (gate reads True)
-    assert aligns[0].edgar_label == "FY2026Q1"
-    assert aligns[0].date_label == "FY2026Q1"
+    report = check_label_alignment([comparative, original], NVDA_CAL)
+    assert len(report.in_window) == 1
+    assert report.aligned  # anchored to the ORIGINAL -> aligned (gate reads True)
+    assert report.in_window[0].edgar_label == "FY2026Q1"
+    assert report.in_window[0].date_label == "FY2026Q1"
     # Actuals keyed by DATE; the comparative's drift is ignored.
     _d, actuals = actuals_from_fundamentals([comparative, original], NVDA_CAL)
     assert actuals == {"FY2026Q1": 0.85}
@@ -65,12 +65,30 @@ def test_original_and_comparative_align_via_earliest_filed() -> None:
 def test_drift_is_surfaced_when_only_comparative_seen() -> None:
     # If only the drifted comparative is present, the gate SURFACES the drift...
     comparative = _q1_fy2026("FY2027Q1", filed=date(2026, 5, 28))
-    aligns = check_label_alignment([comparative], NVDA_CAL)
-    assert not aligns[0].agree
-    assert aligns[0].edgar_label == "FY2027Q1" and aligns[0].date_label == "FY2026Q1"
+    report = check_label_alignment([comparative], NVDA_CAL)
+    assert not report.aligned
+    assert report.in_window[0].edgar_label == "FY2027Q1"
+    assert report.in_window[0].date_label == "FY2026Q1"
     # ...but the actual is STILL keyed to the correct fiscal year by date.
     _d, actuals = actuals_from_fundamentals([comparative], NVDA_CAL)
     assert actuals == {"FY2026Q1": 0.85}
+
+
+def test_gate_scopes_to_recent_window_and_exempts_old_drift() -> None:
+    # Recent quarter (in window) aligns; an OLD quarter (pre-window) drifts but is
+    # EXEMPT — so the verdict reads True. (NVIDIA's pre-2023 boundaries shifted.)
+    recent = _q1_fy2026("FY2026Q1", filed=date(2025, 5, 28))  # FY2026, aligns
+    old_drift = FundamentalRecord(  # 2009-04-26: date FY2010Q1 but EDGAR FY2010Q2
+        ticker="NVDA", cik="1045810", fiscal_period="FY2010Q1",
+        period_end_date=date(2009, 4, 26), filed_date=date(2009, 5, 1),
+        metric="eps_diluted", value=0.01, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2010Q2",
+    )
+    report = check_label_alignment([recent, old_drift], NVDA_CAL, trailing_years=3)
+    assert report.anchor_fy == 2026 and report.window_start_fy == 2024
+    assert [a.period_end for a in report.in_window] == [date(2025, 4, 27)]
+    assert report.aligned  # only the in-window quarter counts, and it aligns
+    assert len(report.older) == 1 and len(report.older_drift) == 1  # old drift exempt + logged
 
 
 def test_actual_ties_to_fmp_annual_by_date_bounds() -> None:

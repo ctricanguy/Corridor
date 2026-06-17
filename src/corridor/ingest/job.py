@@ -28,6 +28,7 @@ from ..constants import (
     EPS_BASIS_ADJUSTED_DILUTED,
     JOB_DAILY_REFRESH,
     REASON_INCOMPLETE_WINDOW,
+    STATUS_ERROR,
     STATUS_OK,
     STATUS_PARTIAL,
     STATUS_QUARANTINE,
@@ -41,7 +42,7 @@ from ..datasources.base import (
     PriceSource,
 )
 from . import consistency, gates
-from .fiscal import FiscalCalendar, enumerate_fiscal_quarters, label_period
+from .fiscal import FiscalCalendar, enumerate_fiscal_quarters, fiscal_year_of, label_period
 from .forward_sum import build_forward_eps_sum
 from .reconcile import ntm_cross_check, quarterly_cross_check, reconcile_prices
 from .records import FiscalPeriod, PricePoint, ValuationInput
@@ -295,17 +296,44 @@ class LabelAlignment:
     agree: bool
 
 
-def check_label_alignment(
-    fundamentals: list[FundamentalRecord], cal: FiscalCalendar
-) -> list[LabelAlignment]:
-    """Compare EDGAR's OWN fy/fp label to our date-derived label, per period.
+@dataclass(frozen=True)
+class AlignmentReport:
+    """FY-label alignment, SCOPED to the recent window the forward sum consumes.
 
-    Anchored to the ORIGINAL filing (earliest filed) for each period_end: companyfacts
-    repeats a period as a COMPARATIVE in later filings, and those comparatives carry
-    the later filing's fy (drifting +1yr), which is a companyfacts artifact, not a
-    real misalignment. Comparing the EARLIEST-filed entry's raw fy/fp against the
-    date-derived label gives the company's true convention — so this reads aligned
-    for NVDA, while still catching a genuinely wrong ``fy_end_month`` in config.
+    The forward sum only uses the current fiscal year's reported actuals, so the gate
+    certifies a trailing window (default 3 fiscal years). Quarters inside it MUST
+    align (``aligned`` requires zero drift there). Older quarters are EXEMPT — they
+    are kept in ``older`` and logged for visibility (NVIDIA's pre-2023 period
+    boundaries shifted, so a single fixed calendar can't label 15-year-old quarters),
+    but they never fail the verdict. Display and verdict both use ``in_window`` so
+    they can never show different ranges.
+    """
+
+    window_start_fy: int | None
+    anchor_fy: int | None
+    trailing_years: int
+    in_window: list[LabelAlignment]
+    older: list[LabelAlignment]
+
+    @property
+    def aligned(self) -> bool:
+        return bool(self.in_window) and all(a.agree for a in self.in_window)
+
+    @property
+    def older_drift(self) -> list[LabelAlignment]:
+        return [a for a in self.older if not a.agree]
+
+
+def check_label_alignment(
+    fundamentals: list[FundamentalRecord], cal: FiscalCalendar, trailing_years: int = 3
+) -> AlignmentReport:
+    """Compare EDGAR's OWN fy/fp label to our date-derived label, per period, SCOPED.
+
+    Anchored to the ORIGINAL filing (earliest filed) for each period_end so the +1yr
+    COMPARATIVE artifact is ignored. Partitioned into a trailing ``trailing_years``
+    fiscal-year window (anchored on the most recent reported quarter) and older
+    quarters: only the in-window quarters drive ``aligned``; older ones are exempt and
+    reported separately. This also still catches a genuinely wrong ``fy_end_month``.
     """
     original: dict[date, FundamentalRecord] = {}
     for f in fundamentals:
@@ -316,12 +344,19 @@ def check_label_alignment(
         if cur is None or (cur.filed_date is not None and f.filed_date < cur.filed_date):
             original[f.period_end_date] = f
 
-    out: list[LabelAlignment] = []
+    aligns: list[LabelAlignment] = []
     for end, f in sorted(original.items()):
         date_label = label_period(end, cal)
         edgar_label = f.source_fiscal_period or ""
-        out.append(LabelAlignment(end, edgar_label, date_label, edgar_label == date_label))
-    return out
+        aligns.append(LabelAlignment(end, edgar_label, date_label, edgar_label == date_label))
+
+    if not aligns:
+        return AlignmentReport(None, None, trailing_years, [], [])
+    anchor_fy = max(fiscal_year_of(a.period_end, cal) for a in aligns)
+    window_start_fy = anchor_fy - (trailing_years - 1)
+    in_window = [a for a in aligns if fiscal_year_of(a.period_end, cal) >= window_start_fy]
+    older = [a for a in aligns if fiscal_year_of(a.period_end, cal) < window_start_fy]
+    return AlignmentReport(window_start_fy, anchor_fy, trailing_years, in_window, older)
 
 
 # --- persistence ------------------------------------------------------------
@@ -361,6 +396,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
     cals = config.fiscal_calendars()
     thresholds = config.thresholds
     unsupported = config.unsupported_tickers
+    align_years = config.alignment_trailing_years
     reported_by_ticker = reported_by_ticker or {}
     results: list[PipelineResult] = []
 
@@ -387,13 +423,18 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
             cal = cals.get(ticker, FiscalCalendar(fy_end_month=12))
             fundamentals = _safe_fundamentals(fundamentals_source, ticker, spec.cik)
             edgar_dates, reported_actuals = actuals_from_fundamentals(fundamentals, cal)
-            for la in check_label_alignment(fundamentals, cal):
-                if not la.agree:  # surfaced, never silent — matching still ties by date
-                    logger.warning("%s FY-label drift: EDGAR %s vs date-derived %s (end %s)",
+            report = check_label_alignment(fundamentals, cal, trailing_years=align_years)
+            for la in report.in_window:
+                if not la.agree:  # IN-WINDOW drift is a real problem (e.g. bad fy_end_month)
+                    logger.warning("%s FY-label drift IN GATE WINDOW: EDGAR %s vs date %s (end %s)",
                                    ticker, la.edgar_label, la.date_label, la.period_end)
-                    _log(session, IngestionLog, ticker, STATUS_PARTIAL,
-                         f"FY-label drift EDGAR {la.edgar_label} vs date {la.date_label} "
-                         f"@ {la.period_end} (matched by date)", None)
+                    _log(session, IngestionLog, ticker, STATUS_ERROR,
+                         f"FY-label drift in gate window: EDGAR {la.edgar_label} vs date "
+                         f"{la.date_label} @ {la.period_end}", None)
+            if report.older_drift:  # exempt, but logged (not silently dropped)
+                _log(session, IngestionLog, ticker, STATUS_PARTIAL,
+                     f"{len(report.older_drift)} older quarters exempt from FY-gate "
+                     f"(pre-FY{report.window_start_fy}; boundary drift)", None)
             reported = reported_by_ticker.get(ticker) or edgar_dates
             periods = build_fiscal_periods(estimates, reported, cal, as_of)
             crosscheck = _safe_fmp_price(estimate_source, ticker, as_of)
