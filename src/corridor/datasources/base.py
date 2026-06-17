@@ -66,7 +66,7 @@ class FundamentalRecord:
 
     ticker: str
     cik: str | None
-    fiscal_period: str
+    fiscal_period: str  # AUTHORITATIVE, DATE-derived (label_period on period_end)
     period_end_date: date | None
     filed_date: date | None
     metric: str
@@ -75,6 +75,10 @@ class FundamentalRecord:
     form: str | None
     source: str
     basis: str = "gaap_diluted_continuing_ops"  # EDGAR GAAP basis
+    # EDGAR's OWN fy/fp label (e.g. 'FY2027Q1'). Filing-relative, so it drifts for
+    # comparative periods — kept ONLY to cross-check against the date-derived label,
+    # never trusted for matching. See ingest.job.check_label_alignment.
+    source_fiscal_period: str | None = None
     observation_timestamp: datetime | None = None  # UTC fetch instant
 
 

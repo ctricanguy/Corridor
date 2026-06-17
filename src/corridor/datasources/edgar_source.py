@@ -21,6 +21,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from ..constants import EPS_BASIS_GAAP_DILUTED_CONTINUING
+from ..ingest.fiscal import FiscalCalendar, fiscal_year_label, label_period
 from .base import FundamentalRecord, FundamentalsSource
 
 logger = logging.getLogger(__name__)
@@ -39,11 +40,29 @@ class EdgarFundamentalsSource(FundamentalsSource):
     name = "edgar"
     validated = False
 
-    def __init__(self, user_agent: str, base_url: str = DEFAULT_BASE_URL) -> None:
+    def __init__(
+        self,
+        user_agent: str,
+        fiscal_calendars: dict[str, FiscalCalendar] | None = None,
+        base_url: str = DEFAULT_BASE_URL,
+    ) -> None:
         if not user_agent or "example.com" in user_agent:
             logger.warning("EDGAR User-Agent looks like a placeholder: %r", user_agent)
         self.user_agent = user_agent
+        # Needed to DATE-derive fiscal labels (companyfacts fy/fp drift for
+        # comparatives, so they are never trusted for the label).
+        self.fiscal_calendars = fiscal_calendars or {}
         self.base_url = base_url.rstrip("/")
+
+    def _calendar(self, ticker: str) -> FiscalCalendar:
+        cal = self.fiscal_calendars.get(ticker)
+        if cal is None:
+            logger.warning(
+                "%s: no fiscal calendar configured; defaulting EDGAR labels to a "
+                "December year-end (likely wrong for off-calendar names)", ticker
+            )
+            return FiscalCalendar(fy_end_month=12)
+        return cal
 
     # --- network (untested here) ---------------------------------------------
     def _fetch(self, cik: str) -> dict[str, Any]:
@@ -59,7 +78,7 @@ class EdgarFundamentalsSource(FundamentalsSource):
     def get_fundamentals(self, ticker: str, cik: str | None = None) -> list[FundamentalRecord]:
         if cik is None:
             raise ValueError(f"EDGAR fundamentals require a CIK for {ticker}")
-        return self.parse_companyfacts(self._fetch(cik), ticker, cik)
+        return self.parse_companyfacts(self._fetch(cik), ticker, cik, self._calendar(ticker))
 
     # --- parsing (pure; unit-tested against fixtures) ------------------------
     def parse_companyfacts(
@@ -67,9 +86,11 @@ class EdgarFundamentalsSource(FundamentalsSource):
         payload: dict[str, Any],
         ticker: str,
         cik: str | None = None,
+        cal: FiscalCalendar | None = None,
         observed_at: datetime | None = None,
     ) -> list[FundamentalRecord]:
         observed_at = observed_at or datetime.now(UTC)
+        cal = cal or self._calendar(ticker)
         gaap = payload.get("facts", {}).get("us-gaap", {})
         records: list[FundamentalRecord] = []
         for tag, basis in _EPS_TAGS:
@@ -77,7 +98,7 @@ class EdgarFundamentalsSource(FundamentalsSource):
             if not node:
                 continue
             for entry in node.get("units", {}).get("USD/shares", []):
-                rec = self._entry_to_record(entry, ticker, cik, basis, observed_at)
+                rec = self._entry_to_record(entry, ticker, cik, basis, cal, observed_at)
                 if rec is not None:
                     records.append(rec)
             if records:  # used the preferred tag; don't double-count the fallback
@@ -92,6 +113,7 @@ class EdgarFundamentalsSource(FundamentalsSource):
         ticker: str,
         cik: str | None,
         basis: str,
+        cal: FiscalCalendar,
         observed_at: datetime,
     ) -> FundamentalRecord | None:
         val = entry.get("val")
@@ -105,7 +127,13 @@ class EdgarFundamentalsSource(FundamentalsSource):
         period_type = self._classify(start_raw, end)
         if period_type is None:
             return None  # skip 6mo/9mo YTD spans
-        fiscal_period = f"FY{fy}" if (period_type == "annual" or fp == "FY") else f"FY{fy}{fp}"
+        is_annual = period_type == "annual" or fp == "FY"
+        # AUTHORITATIVE label from the period END DATE. companyfacts fy/fp are the
+        # FILING's fiscal focus, so a comparative period carries a later filing's fy
+        # and drifts +1 year — we must NOT use it for the label.
+        fiscal_period = fiscal_year_label(end, cal) if is_annual else label_period(end, cal)
+        # Raw EDGAR label kept only for the cross-check (check_label_alignment).
+        source_fiscal_period = f"FY{fy}" if is_annual else f"FY{fy}{fp}"
         filed = entry.get("filed")
         return FundamentalRecord(
             ticker=ticker,
@@ -119,6 +147,7 @@ class EdgarFundamentalsSource(FundamentalsSource):
             form=entry.get("form"),
             source=self.name,
             basis=basis,
+            source_fiscal_period=source_fiscal_period,
             observation_timestamp=observed_at,
         )
 

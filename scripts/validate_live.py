@@ -92,7 +92,7 @@ def main() -> int:  # noqa: C901 - linear top-to-bottom diagnostic
     yf_next_q = yf_fwd.get("0q")
 
     # 3. EDGAR actuals ----------------------------------------------------------
-    edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent)
+    edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent, config.fiscal_calendars())
     actuals = edgar.get_fundamentals(TICKER, cik=NVDA_CIK)
     _check_shape("EDGAR actuals", actuals)
     reported, reported_actuals = actuals_from_fundamentals(actuals, cal)

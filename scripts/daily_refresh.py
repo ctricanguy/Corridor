@@ -50,7 +50,9 @@ def main() -> int:
         base_url=fmp_cfg["base_url"],
         page_limit=fmp_cfg.get("estimates_page_limit", 100),
     )
-    fundamentals_source = EdgarFundamentalsSource(settings.sec_edgar_user_agent)
+    fundamentals_source = EdgarFundamentalsSource(
+        settings.sec_edgar_user_agent, config.fiscal_calendars()
+    )
 
     print("Adapters are UNVALIDATED against live endpoints — run validate_live.py first.")
     with session_scope() as session:

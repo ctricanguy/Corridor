@@ -117,18 +117,24 @@ def test_fmp_parse_price_handles_stable_list_and_legacy_dict() -> None:
     assert fmp.parse_price([], on) is None  # no matching bar
 
 
-def test_edgar_parse_uses_continuing_ops_and_classifies_by_span() -> None:
+def test_edgar_date_derives_label_and_ignores_comparative_drift() -> None:
+    # Fixture has the Apr-2025 quarter TWICE: original (fy=2026) and a comparative
+    # filed a year later (fy=2027). Both must DATE-derive to FY2026Q1; the drifted
+    # fy/fp survives only in source_fiscal_period.
     payload = load_fixture("edgar_nvda_companyfacts.json")
-    recs = EdgarFundamentalsSource("Test test@corridor.local").parse_companyfacts(
-        payload, "NVDA", cik="1045810"
-    )
-    labels = {r.fiscal_period: r for r in recs}
-    # 90-day Q1 kept; 364-day FY kept; 181-day 6-month YTD skipped.
-    assert set(labels) == {"FY2026Q1", "FY2025"}
-    q1 = labels["FY2026Q1"]
-    assert q1.value == pytest.approx(0.85)
-    assert q1.basis == "gaap_diluted_continuing_ops"
-    assert q1.filed_date == date(2025, 5, 28)  # point-in-time filing date retained
+    edgar = EdgarFundamentalsSource("Test test@corridor.local", {"NVDA": NVDA_CAL})
+    recs = edgar.parse_companyfacts(payload, "NVDA", cik="1045810")
+
+    # 90-day Q1 (x2: original + comparative) kept; 364-day FY kept; 181-day YTD skipped.
+    assert {r.fiscal_period for r in recs} == {"FY2026Q1", "FY2025"}
+    q1s = [r for r in recs if r.fiscal_period == "FY2026Q1"]
+    assert len(q1s) == 2
+    assert all(r.value == pytest.approx(0.85) for r in q1s)
+    assert all(r.basis == "gaap_diluted_continuing_ops" for r in q1s)
+    # The raw EDGAR labels differ (original vs drifted comparative); date label does not.
+    assert {r.source_fiscal_period for r in q1s} == {"FY2026Q1", "FY2027Q1"}
+    original = next(r for r in q1s if r.source_fiscal_period == "FY2026Q1")
+    assert original.filed_date == date(2025, 5, 28)
     assert_records_shape(recs)
 
 

@@ -105,7 +105,7 @@ def main() -> int:  # noqa: C901 - linear diagnostic
     price = latest.close
     yf_fwd = yfs.fetch_forward_eps(TICKER)
     yf_0q, yf_1q = yf_fwd.get("0q"), yf_fwd.get("+1q")
-    edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent)
+    edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent, config.fiscal_calendars())
     actuals = edgar.get_fundamentals(TICKER, cik=NVDA_CIK)
 
     reported_dates, reported_actuals = actuals_from_fundamentals(actuals, cal)

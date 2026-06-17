@@ -298,27 +298,30 @@ class LabelAlignment:
 def check_label_alignment(
     fundamentals: list[FundamentalRecord], cal: FiscalCalendar
 ) -> list[LabelAlignment]:
-    """Compare each EDGAR quarter's filed label to our date-derived label.
+    """Compare EDGAR's OWN fy/fp label to our date-derived label, per period.
 
-    Disagreement means the company's (or provider's) FY-naming convention differs
-    from our FiscalCalendar — which would silently misalign actuals if we matched by
-    label string. We DON'T (we match by date), so this is a verification/warning,
-    and it also catches a wrong ``fy_end_month`` in config.
+    Anchored to the ORIGINAL filing (earliest filed) for each period_end: companyfacts
+    repeats a period as a COMPARATIVE in later filings, and those comparatives carry
+    the later filing's fy (drifting +1yr), which is a companyfacts artifact, not a
+    real misalignment. Comparing the EARLIEST-filed entry's raw fy/fp against the
+    date-derived label gives the company's true convention — so this reads aligned
+    for NVDA, while still catching a genuinely wrong ``fy_end_month`` in config.
     """
-    out: list[LabelAlignment] = []
-    seen: set[str] = set()
+    original: dict[date, FundamentalRecord] = {}
     for f in fundamentals:
-        if "Q" not in f.fiscal_period or f.period_end_date is None:
+        src = f.source_fiscal_period
+        if src is None or "Q" not in src or f.period_end_date is None or f.filed_date is None:
             continue
-        if f.fiscal_period in seen:
-            continue
-        seen.add(f.fiscal_period)
-        date_label = label_period(f.period_end_date, cal)
-        out.append(
-            LabelAlignment(f.period_end_date, f.fiscal_period, date_label,
-                           f.fiscal_period == date_label)
-        )
-    return sorted(out, key=lambda a: a.period_end)
+        cur = original.get(f.period_end_date)
+        if cur is None or (cur.filed_date is not None and f.filed_date < cur.filed_date):
+            original[f.period_end_date] = f
+
+    out: list[LabelAlignment] = []
+    for end, f in sorted(original.items()):
+        date_label = label_period(end, cal)
+        edgar_label = f.source_fiscal_period or ""
+        out.append(LabelAlignment(end, edgar_label, date_label, edgar_label == date_label))
+    return out
 
 
 # --- persistence ------------------------------------------------------------
