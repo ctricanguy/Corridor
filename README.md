@@ -131,6 +131,12 @@ with invariants, each backed by an adversarial test:
   `filed_date`). Every value carries `source`, `observation_timestamp` (UTC), a
   `basis`, and — for the forward sum — a `construction_method` string recording
   *exactly* how it was built (e.g. "2 real quarterly + 2 derived from FY2027 annual").
+- **Deriving a missing quarter.** When a window quarter has no provider quarterly
+  estimate, it is split out of the fiscal-year annual *correctly*:
+  `derived = (annual − Σ reported_actuals_in_FY − Σ real_quarterly_ests_in_FY) /
+  count(quarters with neither)`. An already-**reported** quarter (EDGAR actual) is
+  subtracted from the annual and excluded from the divisor — e.g. NVDA mid-FY2026
+  with Q1 reported divides by **1**, not 2.
 - **The window.** "Next 4 unreported quarters" is keyed off **confirmed report
   dates** and each company's **own fiscal calendar** (NVDA ends late January, AAPL
   September, AVGO November…), never calendar quarters. It rolls the moment a quarter

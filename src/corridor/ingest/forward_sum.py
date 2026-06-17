@@ -1,18 +1,25 @@
 """Build the next-4-quarter forward-EPS sum with full provenance.
 
-For each quarter in the window we prefer a REAL provider quarterly estimate. When
-a quarter has no quarterly estimate but its fiscal year has an annual estimate, we
-DERIVE it by splitting the annual across that year's not-yet-known quarters:
+For each quarter in the window we prefer a REAL provider quarterly estimate. When a
+quarter has no quarterly estimate but its fiscal year has an annual estimate, we
+DERIVE it by splitting the annual across that year's GENUINELY UNKNOWN quarters —
+the ones with neither a reported actual nor a real estimate:
 
-    per_missing_quarter = (annual_FY - sum(known real quarters of FY)) / (4 - k)
+    derived_quarter = (annual_FY
+                       - Σ reported_actuals_in_FY        # already-reported quarters (EDGAR)
+                       - Σ real_quarterly_ests_in_FY)    # quarters we have an estimate for
+                      / count(quarters in FY with NEITHER an actual nor an estimate)
 
-where ``k`` is how many of the fiscal year's quarters we already have as real
-estimates. (So two known + two missing in one fiscal year derives the pair as
-``(annual - known)/2`` — never a bare annual/4 guess when better info exists.)
+This is the correctness-critical part: an earlier quarter of the same fiscal year
+that has already REPORTED must be subtracted from the annual AND excluded from the
+divisor. (NVDA mid-FY2026: Q1 reported, Q2/Q3 estimated, only Q4 unknown -> divide
+by 1, not 2.) Reported actuals come from EDGAR and are threaded in by the caller;
+when they are absent, an unreported-and-unestimated quarter is conservatively
+treated as unknown (it stays in the divisor).
 
 Every component records its method, and the coverage score = real / total. A
-quarter that is neither available as quarterly nor derivable from an annual is
-NOT fabricated — the sum is marked incomplete and the caller logs/quarantines it.
+quarter that is neither available as quarterly nor derivable from an annual is NOT
+fabricated — the sum is marked incomplete and the caller logs/quarantines it.
 """
 
 from __future__ import annotations
@@ -40,10 +47,36 @@ def _fy_key(year: int) -> str:
     return f"FY{year}"
 
 
+def _fy_breakdown(
+    year: int,
+    quarterly_estimates: dict[str, float],
+    reported_actuals: dict[str, float],
+) -> tuple[float, float, list[str]]:
+    """Split a fiscal year's four quarters into known actuals, known estimates, unknowns.
+
+    Actual takes precedence over estimate for the same quarter. Returns
+    ``(actual_sum, estimate_sum, unknown_labels)`` where ``unknown_labels`` are the
+    FY quarters with NEITHER an actual nor an estimate — the divisor set.
+    """
+    actual_sum = 0.0
+    estimate_sum = 0.0
+    unknown: list[str] = []
+    for q in (1, 2, 3, 4):
+        label = f"FY{year}Q{q}"
+        if label in reported_actuals:
+            actual_sum += reported_actuals[label]
+        elif label in quarterly_estimates:
+            estimate_sum += quarterly_estimates[label]
+        else:
+            unknown.append(label)
+    return actual_sum, estimate_sum, unknown
+
+
 def build_forward_eps_sum(
     window: WindowResult,
     quarterly_estimates: dict[str, float],
     annual_estimates: dict[str, float],
+    reported_actuals: dict[str, float] | None = None,
 ) -> ForwardSumResult:
     """Construct the forward-EPS sum for the window's quarters.
 
@@ -51,21 +84,16 @@ def build_forward_eps_sum(
         window: the next-N unreported quarters (from ``unreported_window``).
         quarterly_estimates: {fiscal_period -> eps} real provider quarterly estimates.
         annual_estimates: {'FY2027' -> eps} provider annual estimates (for derivation).
+        reported_actuals: {fiscal_period -> eps} already-reported quarterly actuals
+            (EDGAR). Subtracted from the annual and excluded from the divisor when
+            deriving a quarter in the same fiscal year. Defaults to none.
 
     Returns:
         ForwardSumResult with per-quarter components, the full construction string,
         the coverage score, and a completeness flag (False if any quarter could be
         neither found nor derived — never fabricated).
     """
-    # How many real quarterly estimates we hold per fiscal year (for the divisor).
-    known_per_fy: dict[int, list[float]] = {}
-    for label, value in quarterly_estimates.items():
-        try:
-            year, _ = _parse_period(label)
-        except ValueError:
-            continue
-        known_per_fy.setdefault(year, []).append(value)
-
+    reported_actuals = reported_actuals or {}
     components: list[EstimateComponent] = []
     complete = True
 
@@ -83,34 +111,38 @@ def build_forward_eps_sum(
             )
             continue
 
-        # No quarterly estimate — try to derive from the fiscal year's annual.
+        # No quarterly estimate — derive from the fiscal year's annual, subtracting
+        # already-known quarters (actuals + estimates) and dividing only by the
+        # genuinely unknown quarters of that fiscal year.
         year, _q = _parse_period(label)
         annual = annual_estimates.get(_fy_key(year))
-        known_values = known_per_fy.get(year, [])
-        k = len(known_values)
-        remaining_quarters = 4 - k
-        if annual is None or remaining_quarters <= 0:
+        actual_sum, estimate_sum, unknown = _fy_breakdown(
+            year, quarterly_estimates, reported_actuals
+        )
+        if annual is None or not unknown:
             complete = False
             logger.warning(
                 "Cannot build quarter %s: no quarterly estimate and no usable FY%d annual "
-                "(annual=%s, known_quarters=%d). Not fabricating; marking incomplete.",
+                "(annual=%s, unknown_quarters=%d). Not fabricating; marking incomplete.",
                 label,
                 year,
                 annual,
-                k,
+                len(unknown),
             )
             continue
 
-        per_missing = (annual - sum(known_values)) / remaining_quarters
+        remainder = annual - actual_sum - estimate_sum
+        per_unknown = remainder / len(unknown)
         components.append(
             EstimateComponent(
                 fiscal_period=label,
-                value=per_missing,
+                value=per_unknown,
                 method=METHOD_DERIVED_FROM_ANNUAL,
                 is_derived=True,
                 detail=(
-                    f"FY{year} annual {annual:.4f} minus {sum(known_values):.4f} known, "
-                    f"/{remaining_quarters} remaining quarter(s)"
+                    f"FY{year} annual {annual:.4f} - actuals {actual_sum:.4f} "
+                    f"- est {estimate_sum:.4f} = {remainder:.4f}, "
+                    f"/{len(unknown)} unknown ({', '.join(unknown)})"
                 ),
             )
         )

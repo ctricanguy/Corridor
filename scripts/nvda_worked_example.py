@@ -46,14 +46,20 @@ PERIODS = [
     FiscalPeriod("FY2027Q1", date(2026, 4, 26), date(2026, 5, 27), confirmed=False),
 ]
 
+# FY2026Q1 has already REPORTED — its EDGAR actual must be subtracted from the
+# FY2026 annual and EXCLUDED from the derivation divisor (so FY2026Q4 divides by 1,
+# not 2). This is the correctness check on the derived-from-annual path.
+REPORTED_ACTUALS = {"FY2026Q1": 0.80}  # synthetic reported actual (EDGAR)
+
 # Provider estimates as snapshotted on AS_OF: 2 real quarterly, then only annuals
-# for the back half (so Q4 + next-Q1 are DERIVED).
+# for the back half (so Q4 + next-FY Q1 are DERIVED).
 QUARTERLY = {"FY2026Q2": 1.00, "FY2026Q3": 1.20}  # real per-quarter consensus
 ANNUAL = {"FY2026": 4.40, "FY2027": 6.00}          # annual consensus (for derivation)
 
 # Synthetic price paired with the SAME date as the estimate observation.
+# Chosen so the final True P/E lands on a clean 25.0 (127.50 / 5.10).
 PRICE = PricePoint(
-    price_date=AS_OF, raw_close=120.00, adj_close=120.00, split_ratio=1.0,
+    price_date=AS_OF, raw_close=127.50, adj_close=127.50, split_ratio=1.0,
     currency="USD", source="synthetic",
 )
 
@@ -86,9 +92,10 @@ def main() -> None:
     print(f"  window complete : {window.complete}  (4 of {window.available} unreported)")
 
     _hr("3. Forward-EPS sum (real quarterly preferred; else derive from annual)")
+    print(f"  reported actuals (EDGAR) : {REPORTED_ACTUALS}")
     print(f"  real quarterly estimates : {QUARTERLY}")
     print(f"  annual estimates         : {ANNUAL}")
-    fwd = build_forward_eps_sum(window, QUARTERLY, ANNUAL)
+    fwd = build_forward_eps_sum(window, QUARTERLY, ANNUAL, REPORTED_ACTUALS)
     print()
     for c in fwd.components:
         kind = "DERIVED" if c.is_derived else "real   "
@@ -117,6 +124,7 @@ def main() -> None:
     result = assemble_valuation(
         ticker=TICKER, as_of=AS_OF, price_point=PRICE, report_currency="USD",
         estimate_records=_as_records(), fiscal_periods=PERIODS,
+        reported_actuals=REPORTED_ACTUALS,
     )
     _hr("6. Full-pipeline cross-check (assemble_valuation)")
     print(f"  status             = {result.status}")

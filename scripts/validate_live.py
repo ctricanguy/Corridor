@@ -34,7 +34,11 @@ from corridor.datasources.edgar_source import EdgarFundamentalsSource  # noqa: E
 from corridor.datasources.fmp_source import FMPForwardEstimateSource  # noqa: E402
 from corridor.datasources.shape import ShapeMismatch, assert_records_shape  # noqa: E402
 from corridor.datasources.yfinance_source import YFinancePriceSource  # noqa: E402
-from corridor.ingest.job import assemble_valuation, build_fiscal_periods  # noqa: E402
+from corridor.ingest.job import (  # noqa: E402
+    actuals_from_fundamentals,
+    assemble_valuation,
+    build_fiscal_periods,
+)
 from corridor.ingest.records import PricePoint  # noqa: E402
 
 TICKER = "NVDA"
@@ -82,12 +86,8 @@ def main() -> int:
     actuals = edgar.get_fundamentals(TICKER, cik=NVDA_CIK)
     _check_shape("EDGAR actuals", actuals)
 
-    # Build fiscal periods: future from estimates, confirmed from EDGAR reports.
-    reported = {
-        a.fiscal_period: a.filed_date
-        for a in actuals
-        if a.filed_date is not None and a.fiscal_period.count("Q") == 1
-    }
+    # Derive confirmed report dates AND reported quarterly actuals from EDGAR.
+    reported, reported_actuals = actuals_from_fundamentals(actuals)
     periods = build_fiscal_periods(estimates, reported, cal, latest.price_date)
 
     _hr("Pairing price with estimate (same observation date)")
@@ -99,7 +99,8 @@ def main() -> int:
     result = assemble_valuation(
         ticker=TICKER, as_of=latest.price_date, price_point=point,
         report_currency=estimates[0].currency, estimate_records=estimates,
-        fiscal_periods=periods, crosscheck_price_fmp=fmp_cross, thresholds=config.thresholds,
+        fiscal_periods=periods, reported_actuals=reported_actuals,
+        crosscheck_price_fmp=fmp_cross, thresholds=config.thresholds,
     )
 
     _hr("RESULT")

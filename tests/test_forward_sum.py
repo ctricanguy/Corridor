@@ -49,6 +49,46 @@ def test_two_real_two_derived_sum_and_coverage() -> None:
     assert "FY2026Q4" in result.construction_method
 
 
+def test_derived_quarter_subtracts_reported_actual_and_shrinks_divisor() -> None:
+    """ADVERSARIAL: an earlier quarter of the fiscal year is already REPORTED.
+
+    FY2026Q1 has an EDGAR actual, so deriving FY2026Q4 must subtract that actual
+    from the annual AND divide by the count of GENUINELY unknown quarters (just Q4
+    -> /1), not by 2. This is the correctness check on the derived-from-annual path.
+    """
+    quarterly = {"FY2026Q2": 1.00, "FY2026Q3": 1.20}
+    annual = {"FY2026": 4.40, "FY2027": 6.00}
+    reported_actuals = {"FY2026Q1": 0.80}  # Q1 already reported
+
+    result = build_forward_eps_sum(_window(), quarterly, annual, reported_actuals)
+    derived = {c.fiscal_period: c for c in result.components if c.is_derived}
+
+    # FY2026Q4 = (4.40 - 0.80 actual - 2.20 est) / 1 unknown = 1.40
+    assert derived["FY2026Q4"].value == pytest.approx(1.40)
+    assert "/1 unknown" in derived["FY2026Q4"].detail
+    assert "actuals 0.8000" in derived["FY2026Q4"].detail
+    # FY2027 has nothing known -> divide the annual by all 4 quarters.
+    assert derived["FY2027Q1"].value == pytest.approx(1.50)
+
+    # Contrast: WITHOUT the actual, Q1 is treated as unknown too -> divisor 2.
+    no_actual = build_forward_eps_sum(_window(), quarterly, annual)
+    q4 = next(c for c in no_actual.components if c.fiscal_period == "FY2026Q4")
+    assert q4.value == pytest.approx(1.10)  # (4.40 - 2.20) / 2 — the fallback path
+
+
+def test_reported_actual_for_two_quarters_leaves_divisor_one() -> None:
+    """Two of the four FY quarters reported, one estimated -> only one unknown (/1)."""
+    # FY2026: Q1 actual, Q2 actual, Q3 estimate, Q4 derived.
+    quarterly = {"FY2026Q3": 1.20}
+    annual = {"FY2026": 4.40, "FY2027": 6.00}
+    reported = {"FY2026Q1": 0.80, "FY2026Q2": 0.90}
+    result = build_forward_eps_sum(_window(), quarterly, annual, reported)
+    q4 = next(c for c in result.components if c.fiscal_period == "FY2026Q4")
+    # (4.40 - (0.80 + 0.90) actuals - 1.20 est) / 1 = 1.50
+    assert q4.value == pytest.approx(1.50)
+    assert "/1 unknown" in q4.detail
+
+
 def test_all_real_has_full_coverage() -> None:
     quarterly = {"FY2026Q2": 1.0, "FY2026Q3": 1.2, "FY2026Q4": 1.3, "FY2027Q1": 1.5}
     result = build_forward_eps_sum(_window(), quarterly, {})

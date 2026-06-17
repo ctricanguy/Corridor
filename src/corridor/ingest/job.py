@@ -19,6 +19,7 @@ tested against a real ADR. Until then such names stay 'unsupported' in config.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,7 @@ from ..constants import (
 from ..datasources.base import (
     ForwardEstimateRecord,
     ForwardEstimateSource,
+    FundamentalRecord,
     FundamentalsSource,
     PriceRecord,
     PriceSource,
@@ -101,6 +103,7 @@ def assemble_valuation(
     report_currency: str,
     estimate_records: list[ForwardEstimateRecord],
     fiscal_periods: list[FiscalPeriod],
+    reported_actuals: dict[str, float] | None = None,
     prior: PriorSnapshot | None = None,
     crosscheck_price_fmp: float | None = None,
     native_ntm: float | None = None,
@@ -132,7 +135,7 @@ def assemble_valuation(
     # 3. Forward window (report-date driven, company fiscal calendar) ---------
     window = unreported_window(fiscal_periods, as_of, n=n_quarters)
     quarterly, annual = _split_estimates(estimate_records)
-    fwd = build_forward_eps_sum(window, quarterly, annual)
+    fwd = build_forward_eps_sum(window, quarterly, annual, reported_actuals)
     if not fwd.complete:
         return PipelineResult(
             ticker, as_of, "incomplete", REASON_INCOMPLETE_WINDOW, fwd.construction_method
@@ -235,6 +238,33 @@ def build_fiscal_periods(
     return sorted(periods, key=lambda p: (p.period_end_date, p.fiscal_period))
 
 
+_QUARTER_LABEL = re.compile(r"^FY\d{4}Q[1-4]$")
+
+
+def actuals_from_fundamentals(
+    fundamentals: list[FundamentalRecord],
+) -> tuple[dict[str, date], dict[str, float]]:
+    """Derive (report_dates, reported_actuals) from EDGAR quarterly fundamentals.
+
+    For each quarterly fiscal period we take the ORIGINALLY-filed record (earliest
+    filed_date) — its filed date is the confirmed report date and its value is the
+    as-reported actual. Both maps come from the same source so the window roll and
+    the derivation divisor never disagree.
+    """
+    report_dates: dict[str, date] = {}
+    actuals: dict[str, float] = {}
+    earliest: dict[str, date] = {}
+    for f in fundamentals:
+        if not _QUARTER_LABEL.match(f.fiscal_period) or f.filed_date is None:
+            continue
+        prev = earliest.get(f.fiscal_period)
+        if prev is None or f.filed_date < prev:
+            earliest[f.fiscal_period] = f.filed_date
+            report_dates[f.fiscal_period] = f.filed_date
+            actuals[f.fiscal_period] = f.value
+    return report_dates, actuals
+
+
 # --- persistence ------------------------------------------------------------
 def _insert_or_ignore(
     session: Session, model: Any, values: dict[str, Any], index_elements: list[str]
@@ -293,8 +323,12 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
                 results.append(PipelineResult(ticker, as_of, "error", detail="missing inputs"))
                 continue
 
+            # EDGAR actuals give BOTH the confirmed report dates (for the window) and
+            # the reported quarterly EPS values (for split-from-annual derivation).
+            fundamentals = _safe_fundamentals(fundamentals_source, ticker, spec.cik)
+            edgar_dates, reported_actuals = actuals_from_fundamentals(fundamentals)
             cal = cals.get(ticker, FiscalCalendar(fy_end_month=12))
-            reported = reported_by_ticker.get(ticker, {})
+            reported = reported_by_ticker.get(ticker) or edgar_dates
             periods = build_fiscal_periods(estimates, reported, cal, as_of)
             crosscheck = _safe_fmp_price(estimate_source, ticker, as_of)
 
@@ -305,6 +339,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
                 report_currency=estimates[0].currency,
                 estimate_records=estimates,
                 fiscal_periods=periods,
+                reported_actuals=reported_actuals,
                 crosscheck_price_fmp=crosscheck,
                 thresholds=thresholds,
             )
@@ -377,6 +412,19 @@ def _safe_fmp_price(estimate_source: Any, ticker: str, as_of: date) -> float | N
     except Exception:
         logger.warning("FMP price cross-check unavailable for %s", ticker)
         return None
+
+
+def _safe_fundamentals(
+    fundamentals_source: FundamentalsSource, ticker: str, cik: str | None
+) -> list[FundamentalRecord]:
+    """Fetch EDGAR fundamentals, tolerating a missing CIK or a network error."""
+    if not cik:
+        return []
+    try:
+        return fundamentals_source.get_fundamentals(ticker, cik=cik)
+    except Exception:
+        logger.warning("EDGAR fundamentals unavailable for %s", ticker)
+        return []
 
 
 def _fwd_row(r: ForwardEstimateRecord) -> dict[str, Any]:

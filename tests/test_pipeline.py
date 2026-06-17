@@ -14,7 +14,7 @@ import pytest
 
 from corridor.config import Config, TickerSpec
 from corridor.constants import REASON_CURRENCY_MISMATCH, REASON_TRUE_PE_JUMP
-from corridor.datasources.base import ForwardEstimateRecord, PriceRecord
+from corridor.datasources.base import ForwardEstimateRecord, FundamentalRecord, PriceRecord
 from corridor.ingest.job import PriorSnapshot, assemble_valuation, run_daily
 from corridor.ingest.records import FiscalPeriod, PricePoint
 
@@ -112,13 +112,20 @@ class _FakeEstimates:
 
 
 class _FakeFundamentals:
-    def get_fundamentals(self, ticker: str, cik: str | None = None):
-        return []
+    """Returns NVDA's FY2026Q1 as a reported EDGAR actual (drives report date + value)."""
+
+    def get_fundamentals(self, ticker: str, cik: str | None = None) -> list[FundamentalRecord]:
+        return [
+            FundamentalRecord(
+                ticker, cik, "FY2026Q1", date(2025, 4, 27), date(2025, 5, 28),
+                "eps_diluted", 0.80, "USD/shares", "10-Q", "edgar",
+            )
+        ]
 
 
 def _job_config() -> Config:
     return Config(
-        universe=[TickerSpec("NVDA", "NVIDIA"), TickerSpec("TSM", "TSMC")],
+        universe=[TickerSpec("NVDA", "NVIDIA", cik="1045810"), TickerSpec("TSM", "TSMC")],
         data={
             "engine_version": "0.1.0",
             "fiscal_calendars": {"NVDA": {"fy_end_month": 1, "fy_end_day": 31}},
@@ -128,6 +135,7 @@ def _job_config() -> Config:
 
 
 def _run(session):  # type: ignore[no-untyped-def]
+    # No reported_by_ticker override: report dates AND actuals both come from EDGAR.
     return run_daily(
         _job_config(),
         price_source=_FakePrices(),
@@ -135,7 +143,6 @@ def _run(session):  # type: ignore[no-untyped-def]
         fundamentals_source=_FakeFundamentals(),
         session=session,
         as_of=AS_OF,
-        reported_by_ticker={"NVDA": {"FY2026Q1": date(2025, 5, 28)}},
     )
 
 
@@ -161,8 +168,12 @@ def test_run_daily_writes_clean_row_quarantines_adr_and_is_idempotent(db_url: st
     with session_scope() as s:
         vals = s.query(ValuationSnapshot).all()
         assert len(vals) == 1
-        assert vals[0].true_pe == pytest.approx(25.0)
+        # EDGAR FY2026Q1 actual (0.80) flows through: FY2026Q4 = (4.40-0.80-2.20)/1 = 1.40,
+        # FY2027Q1 = 6.00/4 = 1.50, sum = 1.00+1.20+1.40+1.50 = 5.10.
+        assert vals[0].forward_eps_ntm == pytest.approx(5.10)
+        assert vals[0].true_pe == pytest.approx(120.0 / 5.10)
         assert vals[0].coverage_score == pytest.approx(0.5)
+        assert "/1 unknown" in vals[0].construction_method  # divisor shrank via the actual
         assert vals[0].price_basis == "raw" and vals[0].report_currency == "USD"
         assert any(
             log.ticker == "TSM" and log.status == "quarantine" for log in s.query(IngestionLog)
