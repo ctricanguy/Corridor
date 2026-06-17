@@ -1,4 +1,4 @@
 [
-  {"date": "2026-01-25", "estimatedEpsAvg": 4.40, "numberAnalystsEstimatedEps": 42, "reportedCurrency": "USD"},
-  {"date": "2027-01-31", "estimatedEpsAvg": 6.00, "numberAnalystsEstimatedEps": 40, "reportedCurrency": "USD"}
+  {"symbol": "NVDA", "date": "2026-01-25", "revenueAvg": 110000000000, "epsLow": 4.10, "epsHigh": 4.70, "epsAvg": 4.40, "numAnalystsRevenue": 44, "numAnalystsEps": 42},
+  {"symbol": "NVDA", "date": "2027-01-31", "revenueAvg": 150000000000, "epsLow": 5.60, "epsHigh": 6.40, "epsAvg": 6.00, "numAnalystsRevenue": 41, "numAnalystsEps": 40}
 ]

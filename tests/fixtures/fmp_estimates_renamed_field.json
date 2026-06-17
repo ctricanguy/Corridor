@@ -1,4 +1,4 @@
 [
-  {"date": "2025-07-27", "epsAvg": 1.00, "numAnalystsEps": 40, "reportedCurrency": "USD"},
-  {"date": "2025-10-26", "epsAvg": 1.20, "numAnalystsEps": 41, "reportedCurrency": "USD"}
+  {"symbol": "NVDA", "date": "2025-07-27", "estimatedEpsAvg": 1.00, "numberAnalystsEstimatedEps": 40},
+  {"symbol": "NVDA", "date": "2025-10-26", "estimatedEpsAvg": 1.20, "numberAnalystsEstimatedEps": 41}
 ]

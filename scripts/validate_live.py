@@ -68,8 +68,12 @@ def main() -> int:
     print(f"  LIVE VALIDATION — {TICKER} — {today} (UTC)")
     _hr()
 
-    # 1. FMP forward estimates --------------------------------------------------
-    fmp = FMPForwardEstimateSource(api_key, {TICKER: cal}, base_url=config.data["fmp"]["base_url"])
+    # 1. FMP forward estimates (CURRENT /stable API) ----------------------------
+    fmp_cfg = config.data["fmp"]
+    fmp = FMPForwardEstimateSource(
+        api_key, {TICKER: cal}, base_url=fmp_cfg["base_url"],
+        page_limit=fmp_cfg.get("estimates_page_limit", 100),
+    )
     estimates = fmp.get_forward_estimates(TICKER, as_of=today)
     _check_shape("FMP estimates", estimates)
 

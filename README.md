@@ -124,13 +124,14 @@ The whole system's validity rests on two numbers per `(ticker, date)`: the
 forward-EPS sum and the price paired with it. The pipeline protects that pairing
 with invariants, each backed by an adversarial test:
 
-- **Sourcing & provenance.** Forward estimates from **FMP** (`period=quarter`, true
-  per-quarter forward EPS — viable on the **free tier**: 250 req/day easily covers
-  10 names accumulating daily); prices from **yfinance** (cross-checked against
-  FMP); realized actuals from **EDGAR XBRL** (diluted EPS, continuing ops, with
-  `filed_date`). Every value carries `source`, `observation_timestamp` (UTC), a
-  `basis`, and — for the forward sum — a `construction_method` string recording
-  *exactly* how it was built (e.g. "2 real quarterly + 2 derived from FY2027 annual").
+- **Sourcing & provenance.** Forward estimates from **FMP's current `/stable`
+  API** (`/stable/analyst-estimates?symbol=&period=quarter`, true per-quarter
+  forward EPS; the deprecated `/api/v3` path 403s); prices from **yfinance**
+  (cross-checked against FMP); realized actuals from **EDGAR XBRL** (diluted EPS,
+  continuing ops, with `filed_date`). The api key is read from `.env` and is
+  **redacted** from any logged URL or request error. Every value carries `source`,
+  `observation_timestamp` (UTC), a `basis`, and — for the forward sum — a
+  `construction_method` string recording *exactly* how it was built.
 - **Deriving a missing quarter.** When a window quarter has no provider quarterly
   estimate, it is split out of the fiscal-year annual *correctly*:
   `derived = (annual − Σ reported_actuals_in_FY − Σ real_quarterly_ests_in_FY) /

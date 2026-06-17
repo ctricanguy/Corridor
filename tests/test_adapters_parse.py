@@ -49,14 +49,37 @@ def test_fmp_annual_parse() -> None:
     assert by_label == {"FY2026": 4.40, "FY2027": 6.00}
 
 
-def test_fmp_renamed_field_yields_zero_rows_and_fails_shape() -> None:
-    # Simulates FMP's "stable" endpoint shape (epsAvg instead of estimatedEpsAvg):
-    # the parser finds no consensus EPS, returns nothing, and the shape guard fires.
+def test_fmp_legacy_shape_yields_zero_rows_and_fails_shape() -> None:
+    # Feeding DEPRECATED v3 data (estimatedEpsAvg) to the /stable parser (which
+    # reads epsAvg) finds no consensus EPS, returns nothing, and the shape guard
+    # fires loudly — exactly the ShapeMismatch case the migration must catch.
     payload = load_fixture("fmp_estimates_renamed_field.json")
     recs = _fmp().parse_estimates(payload, "NVDA", AS_OF, "quarter", NVDA_CAL)
     assert recs == []
     with pytest.raises(ShapeMismatch):
         assert_records_shape(recs)
+
+
+def test_fmp_redacts_apikey_in_urls_and_errors() -> None:
+    from corridor.datasources.fmp_source import _redact
+
+    leaky = "https://financialmodelingprep.com/stable/analyst-estimates?symbol=NVDA&apikey=SECRET_abc123"
+    assert "SECRET_abc123" not in _redact(leaky)
+    assert "***REDACTED***" in _redact(leaky)
+    # The realistic leak vector: a requests HTTPError message embeds the full URL,
+    # and run_daily logs str(exc) to ingestion_log.
+    err = "403 Client Error: Forbidden for url: " + leaky
+    assert "SECRET_abc123" not in _redact(err)
+
+
+def test_fmp_parse_price_handles_stable_list_and_legacy_dict() -> None:
+    fmp = _fmp()
+    on = date(2025, 6, 16)
+    stable = [{"symbol": "NVDA", "date": "2025-06-16", "open": 130.0, "close": 131.25}]
+    assert fmp.parse_price(stable, on) == pytest.approx(131.25)  # stable flat list
+    legacy = {"symbol": "NVDA", "historical": [{"date": "2025-06-16", "close": 131.25}]}
+    assert fmp.parse_price(legacy, on) == pytest.approx(131.25)  # legacy wrapped shape
+    assert fmp.parse_price([], on) is None  # no matching bar
 
 
 def test_edgar_parse_uses_continuing_ops_and_classifies_by_span() -> None:

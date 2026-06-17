@@ -140,7 +140,10 @@ data:
   # scripts/validate_live.py has been run with a real key + network.
   fmp:
     base_url: "https://financialmodelingprep.com"
+    # CURRENT stable API: /stable/analyst-estimates?symbol=&period=&page=&limit=
+    # (the deprecated /api/v3 path 403s). The api key lives in .env (FMP_API_KEY).
     forward_window_buffer_days: 120   # retain a just-ended, unreported quarter
+    estimates_page_limit: 100         # rows per page; the adapter pages through if needed
 
   # Reconciliation / sanity thresholds (each one is exercised by a test).
   thresholds:

@@ -42,9 +42,13 @@ def main() -> int:
     config = load_config()
     init_db(settings.database_url)
 
+    fmp_cfg = config.data["fmp"]
     price_source = YFinancePriceSource()
     estimate_source = FMPForwardEstimateSource(
-        api_key, config.fiscal_calendars(), base_url=config.data["fmp"]["base_url"]
+        api_key,
+        config.fiscal_calendars(),
+        base_url=fmp_cfg["base_url"],
+        page_limit=fmp_cfg.get("estimates_page_limit", 100),
     )
     fundamentals_source = EdgarFundamentalsSource(settings.sec_edgar_user_agent)
 

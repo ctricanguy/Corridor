@@ -1,8 +1,8 @@
 [
-  {"date": "2023-01-29", "estimatedEpsAvg": 0.88, "numberAnalystsEstimatedEps": 30, "reportedCurrency": "USD"},
-  {"date": "2025-04-27", "estimatedEpsAvg": 0.90, "numberAnalystsEstimatedEps": 38, "reportedCurrency": "USD"},
-  {"date": "2025-07-27", "estimatedEpsAvg": 1.00, "numberAnalystsEstimatedEps": 40, "reportedCurrency": "USD"},
-  {"date": "2025-10-26", "estimatedEpsAvg": 1.20, "numberAnalystsEstimatedEps": 41, "reportedCurrency": "USD"},
-  {"date": "2026-01-25", "estimatedEpsAvg": null, "numberAnalystsEstimatedEps": 0, "reportedCurrency": "USD"},
-  {"date": "2026-04-26", "estimatedEpsAvg": 1.50, "numberAnalystsEstimatedEps": 35, "reportedCurrency": "USD"}
+  {"symbol": "NVDA", "date": "2023-01-29", "revenueAvg": 6000000000, "epsLow": 0.80, "epsHigh": 0.96, "epsAvg": 0.88, "numAnalystsRevenue": 32, "numAnalystsEps": 30},
+  {"symbol": "NVDA", "date": "2025-04-27", "revenueAvg": 24000000000, "epsLow": 0.84, "epsHigh": 0.96, "epsAvg": 0.90, "numAnalystsRevenue": 40, "numAnalystsEps": 38},
+  {"symbol": "NVDA", "date": "2025-07-27", "revenueAvg": 26000000000, "epsLow": 0.94, "epsHigh": 1.07, "epsAvg": 1.00, "numAnalystsRevenue": 42, "numAnalystsEps": 40},
+  {"symbol": "NVDA", "date": "2025-10-26", "revenueAvg": 29000000000, "epsLow": 1.12, "epsHigh": 1.29, "epsAvg": 1.20, "numAnalystsRevenue": 43, "numAnalystsEps": 41},
+  {"symbol": "NVDA", "date": "2026-01-25", "revenueAvg": 31000000000, "epsLow": null, "epsHigh": null, "epsAvg": null, "numAnalystsRevenue": 0, "numAnalystsEps": 0},
+  {"symbol": "NVDA", "date": "2026-04-26", "revenueAvg": 33000000000, "epsLow": 1.40, "epsHigh": 1.61, "epsAvg": 1.50, "numAnalystsRevenue": 36, "numAnalystsEps": 35}
 ]
