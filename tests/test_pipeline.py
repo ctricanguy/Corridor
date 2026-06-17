@@ -62,6 +62,31 @@ def test_assemble_clean_true_pe() -> None:
     assert r.valuation.price_basis == "raw"
 
 
+def test_assemble_annual_only_path_v1() -> None:
+    """v1 Starter path: NO quarterly estimates — every quarter derived from the
+    multi-year annual curve, with the reported FY2026Q1 actual subtracted."""
+    annual = [
+        ForwardEstimateRecord("NVDA", AS_OF, "annual", "FY2026", date(2026, 1, 25),
+                              "eps", 4.40, 40, "fmp"),
+        ForwardEstimateRecord("NVDA", AS_OF, "annual", "FY2027", date(2027, 1, 31),
+                              "eps", 6.00, 40, "fmp"),
+    ]
+    r = assemble_valuation(
+        ticker="NVDA", as_of=AS_OF, price_point=_point(), report_currency="USD",
+        estimate_records=annual, fiscal_periods=PERIODS,
+        reported_actuals={"FY2026Q1": 0.80}, yf_next_quarter_eps=1.10,
+    )
+    assert r.status == "ok"
+    v = r.valuation
+    assert v is not None
+    # FY2026 Q2/Q3/Q4 each = (4.40 - 0.80)/3 = 1.20 ; FY2027Q1 = 6.00/4 = 1.50.
+    assert v.forward_eps_sum == pytest.approx(1.20 * 3 + 1.50)  # 5.10
+    assert v.coverage_score == pytest.approx(0.0)  # all derived from annual
+    # Quarterly cross-check: derived next-Q 1.20 vs yfinance 1.10 (~9% < 15%) -> no flag.
+    assert v.yf_next_q_eps == pytest.approx(1.10)
+    assert not v.quarterly_xcheck_flag
+
+
 def test_assemble_rejects_adr_currency_mismatch() -> None:
     # Report currency TWD vs USD price -> unsupported, never a naive P/E.
     r = assemble_valuation(

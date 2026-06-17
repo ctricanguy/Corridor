@@ -1,21 +1,22 @@
 #!/usr/bin/env python
 r"""LIVE validation for NVDA — run this LOCALLY (needs network + FMP_API_KEY).
 
-This is the one-command step that turns the UNVALIDATED adapters into trusted ones.
-It does three things:
+The one-command step that turns the UNVALIDATED adapters into trusted ones. It:
 
-  1. Fetches NVDA from FMP (quarterly + annual estimates), yfinance (price), and
-     EDGAR (realized diluted EPS).
+  1. Fetches NVDA from FMP (/stable ANNUAL estimates — the v1 source on Starter;
+     period=quarter is Premium-gated), yfinance (price + a next-quarter EPS
+     cross-check), and EDGAR (realized diluted EPS).
   2. Asserts the LIVE parsed records match the SAME shape contract the fixtures
-     satisfy (corridor.datasources.shape). A renamed/absent provider field — the
-     single most likely real-world break — fails loudly here, naming the field.
-  3. Prints every intermediate value in the same format as the synthetic worked
-     example, then computes the REAL True P/E so you can hand-verify it.
+     satisfy. A renamed/absent provider field fails loudly here, naming the field.
+  3. Prints the FULL annual-path breakdown so you can hand-verify the number:
+     the multi-year annual curve, EDGAR actuals subtracted for reported quarters,
+     each derived quarter, the forward-EPS sum + construction_method + coverage,
+     the yfinance quarterly cross-check, the paired price, and the True P/E.
 
 It will NOT run in the build sandbox (outbound network is blocked). Run it on your
 machine:
 
-    export FMP_API_KEY=...                 # your key
+    export FMP_API_KEY=...                 # your Starter key
     export SEC_EDGAR_USER_AGENT="You <you@email>"
     python scripts/validate_live.py
 """
@@ -26,6 +27,7 @@ import os
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -49,7 +51,7 @@ def _hr(t: str = "") -> None:
     print(("== " + t + " ").ljust(74, "=") if t else "=" * 74)
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901 - linear top-to-bottom diagnostic
     api_key = os.getenv("FMP_API_KEY")
     if not api_key:
         print("FMP_API_KEY is not set. This script needs a real key + network.")
@@ -63,69 +65,106 @@ def main() -> int:
         print(f"No fiscal calendar configured for {TICKER}.")
         return 2
     today = datetime.now(UTC).date()
-
-    _hr()
-    print(f"  LIVE VALIDATION — {TICKER} — {today} (UTC)")
-    _hr()
-
-    # 1. FMP forward estimates (CURRENT /stable API) ----------------------------
     fmp_cfg = config.data["fmp"]
+
+    _hr()
+    print(f"  LIVE VALIDATION (annual path) — {TICKER} — {today} (UTC)")
+    _hr()
+
+    # 1. FMP ANNUAL estimates (multi-year curve; Starter, limit<=10) -------------
     fmp = FMPForwardEstimateSource(
         api_key, {TICKER: cal}, base_url=fmp_cfg["base_url"],
-        page_limit=fmp_cfg.get("estimates_page_limit", 100),
+        page_limit=fmp_cfg.get("estimates_page_limit", 10),
+        fetch_quarterly=fmp_cfg.get("fetch_quarterly", False),
     )
     estimates = fmp.get_forward_estimates(TICKER, as_of=today)
-    _check_shape("FMP estimates", estimates)
+    _check_shape("FMP annual estimates", estimates)
 
-    # 2. yfinance price ---------------------------------------------------------
+    # 2. yfinance price + forward-EPS cross-check --------------------------------
     yfs = YFinancePriceSource()
-    start = date(today.year - 1, today.month, 1)
-    prices = yfs.get_prices(TICKER, start=start)
+    prices = yfs.get_prices(TICKER, start=date(today.year - 1, today.month, 1))
     _check_shape("yfinance prices", prices)
     latest = prices[-1]
     fmp_cross = fmp.fetch_price(TICKER, latest.price_date)
+    yf_fwd = yfs.fetch_forward_eps(TICKER)
+    yf_next_q = yf_fwd.get("0q")
 
     # 3. EDGAR actuals ----------------------------------------------------------
     edgar = EdgarFundamentalsSource(settings.sec_edgar_user_agent)
     actuals = edgar.get_fundamentals(TICKER, cik=NVDA_CIK)
     _check_shape("EDGAR actuals", actuals)
-
-    # Derive confirmed report dates AND reported quarterly actuals from EDGAR.
     reported, reported_actuals = actuals_from_fundamentals(actuals)
     periods = build_fiscal_periods(estimates, reported, cal, latest.price_date)
 
-    _hr("Pairing price with estimate (same observation date)")
-    point = PricePoint(
-        price_date=latest.price_date, raw_close=latest.close or 0.0, adj_close=latest.adj_close,
-        split_ratio=latest.split_ratio, currency=latest.currency, source=latest.source,
-    )
-    # Estimates were observed today; pair with today's price for alignment.
     result = assemble_valuation(
-        ticker=TICKER, as_of=latest.price_date, price_point=point,
+        ticker=TICKER, as_of=latest.price_date,
+        price_point=PricePoint(
+            price_date=latest.price_date, raw_close=latest.close or 0.0,
+            adj_close=latest.adj_close, split_ratio=latest.split_ratio,
+            currency=latest.currency, source=latest.source,
+        ),
         report_currency=estimates[0].currency, estimate_records=estimates,
         fiscal_periods=periods, reported_actuals=reported_actuals,
-        crosscheck_price_fmp=fmp_cross, thresholds=config.thresholds,
+        crosscheck_price_fmp=fmp_cross, yf_next_quarter_eps=yf_next_q,
+        thresholds=config.thresholds,
     )
 
-    _hr("RESULT")
-    print(f"  status             = {result.status}")
-    if result.valuation is not None:
-        v = result.valuation
-        print(f"  price (raw)        = {v.price:.4f} {v.price_currency}")
-        print(f"  forward EPS sum    = {v.forward_eps_sum:.4f}")
-        print(f"  construction_method= {v.construction_method}")
-        print(f"  coverage_score     = {v.coverage_score:.2f}")
-        print(f"  REAL True P/E      = {v.true_pe:.4f}")
-        if v.price_disagreement_flag:
-            print(f"  ! price disagreement yf={v.price_yf} fmp={v.price_fmp}")
+    _print_breakdown(estimates, reported_actuals, yf_fwd, latest, result)
+    return 0 if result.status == "ok" else 1
+
+
+def _print_breakdown(
+    estimates: list, reported_actuals: dict, yf_fwd: dict, latest: Any, result: Any
+) -> None:
+    _hr("1. FMP annual estimates (REAL, multi-year curve)")
+    for r in sorted(estimates, key=lambda r: r.period_end_date or date.min):
+        print(f"  {r.fiscal_period}  EPS={r.value:.4f}  period_end={r.period_end_date}  "
+              f"analysts={r.num_analysts}")
+
+    _hr("2. EDGAR reported actuals (subtracted from the current FY annual)")
+    if reported_actuals:
+        for fp, val in sorted(reported_actuals.items()):
+            print(f"  {fp}  actual EPS={val:.4f}")
     else:
-        print(f"  reason_code        = {result.reason_code}")
-        print(f"  detail             = {result.detail}")
+        print("  (none parsed — derivation will treat all current-FY quarters as unknown)")
+
+    if result.valuation is None:
+        _hr("RESULT")
+        print(f"  status      = {result.status}")
+        print(f"  reason_code = {result.reason_code}")
+        print(f"  detail      = {result.detail}")
+        _hr()
+        return
+
+    v = result.valuation
+    _hr("3. Forward-EPS sum (every quarter DERIVED from the annual curve)")
+    for c in v.components:
+        kind = "DERIVED" if c.is_derived else "real   "
+        print(f"  {c.fiscal_period}  {kind}  EPS={c.value:7.4f}   [{c.detail}]")
+    print(f"\n  forward EPS sum     = {v.forward_eps_sum:.4f}")
+    print(f"  construction_method = {v.construction_method}")
+    print(f"  coverage_score      = {v.coverage_score:.2f}  (0.00 = all derived-from-annual)")
+
+    _hr("4. yfinance quarterly cross-check (granularity FMP annual lacks)")
+    print(f"  yfinance forward EPS by period : {yf_fwd or '(unavailable)'}")
+    derived_next_q = v.components[0].value if v.components else None
+    print(f"  our derived next-quarter EPS   : "
+          f"{derived_next_q:.4f}" if derived_next_q is not None else "  (none)")
+    print(f"  yfinance next-quarter EPS      : "
+          f"{v.yf_next_q_eps if v.yf_next_q_eps is not None else '(none)'}")
+    if v.quarterly_xcheck_divergence_pct is not None:
+        flag = "  <-- DISAGREEMENT" if v.quarterly_xcheck_flag else ""
+        print(f"  divergence                     : {v.quarterly_xcheck_divergence_pct:.2%}{flag}")
+
+    _hr("5. Paired price + True P/E")
+    print(f"  price (raw)  = {v.price:.4f} {v.price_currency}  on {latest.price_date}")
+    if v.price_disagreement_flag:
+        print(f"  ! price disagreement: yfinance={v.price_yf} fmp={v.price_fmp}")
+    print(f"  True P/E     = {v.price:.4f} / {v.forward_eps_sum:.4f} = {v.true_pe:.4f}")
     _hr()
     print("  Shapes matched the fixture contract — adapters validated against live.")
-    print("  You may now flip the 'validated' flags / README note for these sources.")
+    print("  coverage_score is 0.00 by design on the annual path (every quarter derived).")
     _hr()
-    return 0
 
 
 def _check_shape(label: str, records: list) -> None:

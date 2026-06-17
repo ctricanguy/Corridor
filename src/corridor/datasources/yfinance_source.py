@@ -100,6 +100,41 @@ class YFinancePriceSource(PriceSource):
             logger.warning("%s: yfinance returned ZERO price bars", ticker)
         return records
 
+    # --- forward-EPS cross-check (UNVALIDATED; best-effort, never raises) -----
+    def fetch_forward_eps(self, ticker: str) -> dict[str, float]:
+        """Best-effort forward EPS consensus by period from yfinance.
+
+        Returns a mapping like ``{'0q': 1.05, '+1q': 1.20, '0y': 4.40, '+1y': 6.00}``
+        ('0q' = current/next-to-report quarter — the quarterly granularity FMP's
+        annual curve lacks). Returns ``{}`` on any problem; NEVER raises, so it can
+        only ever ADD a cross-check, never break the pipeline. UNVALIDATED.
+        """
+        try:
+            import yfinance as yf
+
+            df = yf.Ticker(ticker).get_earnings_estimate()
+            rows = [{"period": str(idx), "avg": row.get("avg")} for idx, row in df.iterrows()]
+            return self._parse_earnings_estimate(rows)
+        except Exception:  # yfinance estimate fields are flaky; degrade silently
+            logger.warning("%s: yfinance forward EPS estimate unavailable (cross-check skipped)",
+                           ticker)
+            return {}
+
+    @staticmethod
+    def _parse_earnings_estimate(rows: list[dict[str, Any]]) -> dict[str, float]:
+        """Map yfinance earnings-estimate rows to {period: avg_eps} (pure; testable)."""
+        out: dict[str, float] = {}
+        for r in rows:
+            period = r.get("period")
+            avg = r.get("avg")
+            if not period or avg is None:
+                continue
+            try:
+                out[str(period)] = float(avg)
+            except (TypeError, ValueError):
+                continue
+        return out
+
 
 def _f(v: Any) -> float | None:
     try:

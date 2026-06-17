@@ -42,7 +42,7 @@ from ..datasources.base import (
 from . import consistency, gates
 from .fiscal import FiscalCalendar, enumerate_fiscal_quarters
 from .forward_sum import build_forward_eps_sum
-from .reconcile import ntm_cross_check, reconcile_prices
+from .reconcile import ntm_cross_check, quarterly_cross_check, reconcile_prices
 from .records import FiscalPeriod, PricePoint, ValuationInput
 from .window import unreported_window
 
@@ -107,6 +107,7 @@ def assemble_valuation(
     prior: PriorSnapshot | None = None,
     crosscheck_price_fmp: float | None = None,
     native_ntm: float | None = None,
+    yf_next_quarter_eps: float | None = None,
     earnings_event: bool = False,
     thresholds: dict[str, float] | None = None,
     n_quarters: int = 4,
@@ -116,6 +117,7 @@ def assemble_valuation(
         "ntm_divergence_pct": 0.10,
         "price_disagreement_pct": 0.01,
         "true_pe_jump_factor": 2.0,
+        "quarterly_xcheck_pct": 0.15,
         **(thresholds or {}),
     }
 
@@ -172,10 +174,15 @@ def assemble_valuation(
         price_point.raw_close, crosscheck_price_fmp, th["price_disagreement_pct"]
     )
     ntm = ntm_cross_check(fwd.value, native_ntm, th["ntm_divergence_pct"])
+    # Quarterly cross-check: our annual-derived NEXT quarter vs yfinance's quarterly.
+    derived_next_q = fwd.components[0].value if fwd.components else 0.0
+    qxc = quarterly_cross_check(derived_next_q, yf_next_quarter_eps, th["quarterly_xcheck_pct"])
     if price_recon.disagreement_flag:
         logger.warning("%s price disagreement: %s", ticker, price_recon.detail)
     if ntm.divergence_flag:
         logger.warning("%s NTM divergence: %s", ticker, ntm.detail)
+    if qxc.disagreement_flag:
+        logger.warning("%s quarterly cross-check disagreement: %s", ticker, qxc.detail)
 
     valuation = ValuationInput(
         ticker=ticker,
@@ -195,6 +202,9 @@ def assemble_valuation(
         price_yf=price_recon.price_yf,
         price_fmp=price_recon.price_fmp,
         price_disagreement_flag=price_recon.disagreement_flag,
+        yf_next_q_eps=qxc.yf_next_q_eps,
+        quarterly_xcheck_divergence_pct=qxc.divergence_pct,
+        quarterly_xcheck_flag=qxc.disagreement_flag,
         components=fwd.components,
     )
     return PipelineResult(
@@ -331,6 +341,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
             reported = reported_by_ticker.get(ticker) or edgar_dates
             periods = build_fiscal_periods(estimates, reported, cal, as_of)
             crosscheck = _safe_fmp_price(estimate_source, ticker, as_of)
+            yf_next_q = _safe_yf_next_q(price_source, ticker)
 
             result = assemble_valuation(
                 ticker=ticker,
@@ -341,6 +352,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
                 fiscal_periods=periods,
                 reported_actuals=reported_actuals,
                 crosscheck_price_fmp=crosscheck,
+                yf_next_quarter_eps=yf_next_q,
                 thresholds=thresholds,
             )
 
@@ -414,6 +426,18 @@ def _safe_fmp_price(estimate_source: Any, ticker: str, as_of: date) -> float | N
         return None
 
 
+def _safe_yf_next_q(price_source: Any, ticker: str) -> float | None:
+    """yfinance next-quarter ('0q') EPS for the cross-check; None if unavailable."""
+    fetch = getattr(price_source, "fetch_forward_eps", None)
+    if fetch is None:
+        return None
+    try:
+        next_q: float | None = fetch(ticker).get("0q")
+        return next_q
+    except Exception:
+        return None
+
+
 def _safe_fundamentals(
     fundamentals_source: FundamentalsSource, ticker: str, cik: str | None
 ) -> list[FundamentalRecord]:
@@ -457,5 +481,8 @@ def _val_row(v: ValuationInput, engine_version: str) -> dict[str, Any]:
         "ntm_eps_native": v.ntm_eps_native, "ntm_divergence_pct": v.ntm_divergence_pct,
         "window_divergence_flag": v.window_divergence_flag, "price_yf": v.price_yf,
         "price_fmp": v.price_fmp, "price_disagreement_flag": v.price_disagreement_flag,
+        "yf_next_q_eps": v.yf_next_q_eps,
+        "quarterly_xcheck_divergence_pct": v.quarterly_xcheck_divergence_pct,
+        "quarterly_xcheck_flag": v.quarterly_xcheck_flag,
         "is_thin_history": True, "engine_version": engine_version,
     }

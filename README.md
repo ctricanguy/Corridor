@@ -125,19 +125,26 @@ forward-EPS sum and the price paired with it. The pipeline protects that pairing
 with invariants, each backed by an adversarial test:
 
 - **Sourcing & provenance.** Forward estimates from **FMP's current `/stable`
-  API** (`/stable/analyst-estimates?symbol=&period=quarter`, true per-quarter
-  forward EPS; the deprecated `/api/v3` path 403s); prices from **yfinance**
-  (cross-checked against FMP); realized actuals from **EDGAR XBRL** (diluted EPS,
-  continuing ops, with `filed_date`). The api key is read from `.env` and is
-  **redacted** from any logged URL or request error. Every value carries `source`,
-  `observation_timestamp` (UTC), a `basis`, and — for the forward sum — a
+  API** — v1 uses **`period=annual`** (the multi-year forward curve), because on
+  the Starter plan `period=quarter` is Premium-gated and the `limit` is capped at
+  10 (the deprecated `/api/v3` path 403s). Prices from **yfinance** (price
+  cross-checked against FMP; its next-quarter EPS is also used as a **quarterly
+  cross-check** the annual curve can't provide). Realized actuals from **EDGAR
+  XBRL** (diluted EPS, continuing ops, with `filed_date`). The api key is read from
+  `.env` and **redacted** from any logged URL or request error. Every value carries
+  `source`, `observation_timestamp` (UTC), a `basis`, and — for the forward sum — a
   `construction_method` string recording *exactly* how it was built.
-- **Deriving a missing quarter.** When a window quarter has no provider quarterly
-  estimate, it is split out of the fiscal-year annual *correctly*:
-  `derived = (annual − Σ reported_actuals_in_FY − Σ real_quarterly_ests_in_FY) /
-  count(quarters with neither)`. An already-**reported** quarter (EDGAR actual) is
-  subtracted from the annual and excluded from the divisor — e.g. NVDA mid-FY2026
-  with Q1 reported divides by **1**, not 2.
+- **Deriving quarters from the annual curve (the v1 path).** With no per-quarter
+  estimates, every forward quarter is split out of its fiscal-year annual
+  *correctly* — NOT a naive annual/4:
+  `derived = (annual_FY − Σ reported_actuals_in_FY − Σ real_quarterly_ests_in_FY) /
+  count(quarters in that FY with neither)`. So the **current FY** subtracts its
+  already-reported actuals (EDGAR) and divides the residual across its remaining
+  unreported quarters (NVDA mid-FY with one quarter reported → ÷3, not ÷4), while
+  quarters **beyond** the current FY use the next FY's annual. `coverage_score` is
+  `0.0` on this path (every quarter derived) — surfaced honestly, never dressed up
+  as per-quarter precision. (Set `fetch_quarterly: true` on a Premium plan to add
+  real per-quarter estimates with no engine change.)
 - **The window.** "Next 4 unreported quarters" is keyed off **confirmed report
   dates** and each company's **own fiscal calendar** (NVDA ends late January, AAPL
   September, AVGO November…), never calendar quarters. It rolls the moment a quarter

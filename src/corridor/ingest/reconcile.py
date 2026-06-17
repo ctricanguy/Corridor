@@ -55,6 +55,43 @@ def reconcile_prices(
 
 
 @dataclass(frozen=True)
+class QuarterlyCrossCheck:
+    derived_next_q_eps: float
+    yf_next_q_eps: float | None
+    divergence_pct: float | None
+    disagreement_flag: bool
+    detail: str | None
+
+
+def quarterly_cross_check(
+    derived_next_q_eps: float,
+    yf_next_q_eps: float | None,
+    threshold_pct: float = 0.15,
+) -> QuarterlyCrossCheck:
+    """Cross-check our annual-derived NEXT-quarter EPS against yfinance's quarterly.
+
+    FMP's annual curve has no per-quarter granularity, so we derive the next
+    quarter from it; yfinance publishes a next-quarter consensus directly. If the
+    two disagree beyond ``threshold_pct`` we set a disagreement flag (stored, not
+    discarded). A coarser default threshold (15%) reflects that the derived figure
+    is an annual split, not a true quarterly estimate.
+    """
+    if yf_next_q_eps is None or yf_next_q_eps == 0:
+        return QuarterlyCrossCheck(
+            derived_next_q_eps, yf_next_q_eps, None, False, "no yfinance next-quarter EPS"
+        )
+    divergence = abs(derived_next_q_eps - yf_next_q_eps) / abs(yf_next_q_eps)
+    flag = divergence > threshold_pct
+    detail = (
+        f"derived next-Q EPS {derived_next_q_eps:.4f} vs yfinance {yf_next_q_eps:.4f} "
+        f"= {divergence:.2%} apart"
+        if flag
+        else None
+    )
+    return QuarterlyCrossCheck(derived_next_q_eps, yf_next_q_eps, divergence, flag, detail)
+
+
+@dataclass(frozen=True)
 class NtmCrossCheck:
     strict_sum: float
     native_ntm: float | None

@@ -133,4 +133,7 @@ class ValuationInput:
     price_yf: float | None = None
     price_fmp: float | None = None
     price_disagreement_flag: bool = False
+    yf_next_q_eps: float | None = None
+    quarterly_xcheck_divergence_pct: float | None = None
+    quarterly_xcheck_flag: bool = False
     components: list[EstimateComponent] = field(default_factory=list)

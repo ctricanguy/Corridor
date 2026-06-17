@@ -261,6 +261,11 @@ class ValuationSnapshot(Base):
     price_yf: Mapped[float | None] = mapped_column(Float)
     price_fmp: Mapped[float | None] = mapped_column(Float)
     price_disagreement_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Quarterly cross-check: our annual-DERIVED next-quarter EPS vs yfinance's
+    # published next-quarter consensus (the granularity FMP's annual curve lacks).
+    yf_next_q_eps: Mapped[float | None] = mapped_column(Float)
+    quarterly_xcheck_divergence_pct: Mapped[float | None] = mapped_column(Float)
+    quarterly_xcheck_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     observation_timestamp: Mapped[datetime | None] = mapped_column(DateTime)  # UTC
 
     # Historical forward-P/E distribution (the corridor, in multiple space).

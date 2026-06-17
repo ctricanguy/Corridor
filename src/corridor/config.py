@@ -96,6 +96,7 @@ class Config:
             "ntm_divergence_pct": 0.10,
             "price_disagreement_pct": 0.01,
             "true_pe_jump_factor": 2.0,
+            "quarterly_xcheck_pct": 0.15,
         }
         return {**defaults, **self.data.get("thresholds", {})}
 

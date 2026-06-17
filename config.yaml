@@ -143,13 +143,18 @@ data:
     # CURRENT stable API: /stable/analyst-estimates?symbol=&period=&page=&limit=
     # (the deprecated /api/v3 path 403s). The api key lives in .env (FMP_API_KEY).
     forward_window_buffer_days: 120   # retain a just-ended, unreported quarter
-    estimates_page_limit: 100         # rows per page; the adapter pages through if needed
+    # v1 = Starter plan: ANNUAL estimates only (period=quarter is Premium-gated),
+    # and limit is capped at 10 (higher 402s). The multi-year annual curve is what
+    # the forward quarters are derived from. Set fetch_quarterly: true on Premium.
+    estimates_page_limit: 10          # Starter cap; adapter pages through if needed
+    fetch_quarterly: false            # Premium only — true per-quarter estimates
 
   # Reconciliation / sanity thresholds (each one is exercised by a test).
   thresholds:
     ntm_divergence_pct: 0.10      # strict 4Q sum vs provider-native NTM -> flag
     price_disagreement_pct: 0.01  # yfinance vs FMP price -> flag (store both)
     true_pe_jump_factor: 2.0      # >Nx day-over-day move w/o split -> quarantine
+    quarterly_xcheck_pct: 0.15    # annual-derived next-Q EPS vs yfinance next-Q -> flag
 
   # Per-company fiscal-year-end (month, day). MANY of these are off-calendar; the
   # corridor window MUST use the company's own fiscal quarters. These seeds are

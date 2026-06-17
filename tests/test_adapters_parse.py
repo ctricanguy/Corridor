@@ -49,6 +49,41 @@ def test_fmp_annual_parse() -> None:
     assert by_label == {"FY2026": 4.40, "FY2027": 6.00}
 
 
+def test_fmp_v1_fetches_annual_only_and_clamps_limit() -> None:
+    # Starter: limit clamps to 10, and only period=annual is fetched (quarter is
+    # Premium-gated). Stub _fetch to prove quarter is never called.
+    fmp = FMPForwardEstimateSource(api_key="x", fiscal_calendars={"NVDA": NVDA_CAL}, page_limit=100)
+    assert fmp.page_limit == 10  # clamped to Starter cap
+    assert fmp.fetch_quarterly is False
+
+    calls: list[str] = []
+    annual_payload = load_fixture("fmp_nvda_estimates_annual.json")
+
+    def fake_fetch(ticker: str, period: str) -> list:
+        calls.append(period)
+        if period == "annual":
+            return annual_payload
+        raise AssertionError("quarter must NOT be fetched on the v1 annual path")
+
+    fmp._fetch = fake_fetch  # type: ignore[method-assign]
+    recs = fmp.get_forward_estimates("NVDA", as_of=AS_OF)
+    assert calls == ["annual"]  # quarter never fetched
+    assert {r.fiscal_period for r in recs} == {"FY2026", "FY2027"}
+    assert all(r.period_type == "annual" for r in recs)
+
+
+def test_yfinance_parse_earnings_estimate() -> None:
+    rows = [
+        {"period": "0q", "avg": 1.05},
+        {"period": "+1q", "avg": 1.20},
+        {"period": "0y", "avg": 4.40},
+        {"period": "+1y", "avg": 6.00},
+        {"period": "+5y", "avg": None},  # skipped (no value)
+    ]
+    out = YFinancePriceSource._parse_earnings_estimate(rows)
+    assert out == {"0q": 1.05, "+1q": 1.20, "0y": 4.40, "+1y": 6.00}
+
+
 def test_fmp_legacy_shape_yields_zero_rows_and_fails_shape() -> None:
     # Feeding DEPRECATED v3 data (estimatedEpsAvg) to the /stable parser (which
     # reads epsAvg) finds no consensus EPS, returns nothing, and the shape guard

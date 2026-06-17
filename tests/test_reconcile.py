@@ -25,6 +25,18 @@ def test_single_source_does_not_flag() -> None:
     assert not r.disagreement_flag and r.price_primary == 100.0
 
 
+def test_quarterly_cross_check_flags_disagreement() -> None:
+    from corridor.ingest.reconcile import quarterly_cross_check
+
+    ok = quarterly_cross_check(derived_next_q_eps=1.10, yf_next_q_eps=1.15, threshold_pct=0.15)
+    assert not ok.disagreement_flag  # ~4.3% apart
+    bad = quarterly_cross_check(1.10, 1.60, threshold_pct=0.15)
+    assert bad.disagreement_flag
+    assert bad.divergence_pct == pytest.approx(abs(1.10 - 1.60) / 1.60)
+    none = quarterly_cross_check(1.10, None)  # yfinance unavailable -> no flag, no crash
+    assert not none.disagreement_flag and none.divergence_pct is None
+
+
 def test_ntm_cross_check_flags_window_divergence() -> None:
     ok = ntm_cross_check(strict_sum=4.80, native_ntm=4.85, threshold_pct=0.10)
     assert not ok.divergence_flag

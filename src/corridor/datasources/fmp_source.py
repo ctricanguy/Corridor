@@ -3,11 +3,15 @@
 !!! UNVALIDATED AGAINST LIVE ENDPOINT !!!
 Written to FMP's CURRENT "stable" API
 (``/stable/analyst-estimates?symbol={SYMBOL}&period={quarter|annual}&page=&limit=``)
-but not yet run against the live API in this build. The legacy ``/api/v3/`` path is
-deprecated and 403s on current plans, so we use ``/stable``; its field names differ
-from v3 (``epsAvg`` not ``estimatedEpsAvg``, ``numAnalystsEps`` not
-``numberAnalystsEstimatedEps``). Run ``scripts/validate_live.py`` with a real key +
-network to confirm the parsed output shape before trusting it.
+but not yet fully re-run against the live API in this build.
+
+v1 plan reality (Starter): ``period=annual`` returns 200 and gives a MULTI-YEAR
+forward curve (current FY + several forward FYs); ``period=quarter`` is gated to
+Premium. So v1 fetches ANNUAL only (``fetch_quarterly=False``) and derives the
+quarterly forward path from the annual curve (see ingest/forward_sum.py). The
+``limit`` is clamped to <=10 (Starter's cap; higher values 402). Field names are
+stable-shape (``epsAvg``, not v3's ``estimatedEpsAvg``). Run
+``scripts/validate_live.py`` to confirm.
 
 Network fetch and JSON parsing are separated so the parser can be unit-tested
 against fixtures and the live validator can assert the live shape matches them.
@@ -31,6 +35,8 @@ DEFAULT_BASE_URL = "https://financialmodelingprep.com"
 # How far before as_of to retain a row, so a just-ended-but-unreported quarter is
 # kept while deep history is dropped (the report-date window then selects).
 _TRAILING_BUFFER_DAYS = 120
+# FMP Starter caps the analyst-estimates ``limit`` at 10; higher values 402.
+_STARTER_LIMIT_CAP = 10
 
 # Mask the apikey query param anywhere it might appear in a logged URL / error.
 _APIKEY_RE = re.compile(r"(apikey=)[^&\s]+", re.IGNORECASE)
@@ -42,7 +48,7 @@ def _redact(text: str) -> str:
 
 
 class FMPForwardEstimateSource(ForwardEstimateSource):
-    """Forward quarterly + annual EPS consensus from FMP /stable. UNVALIDATED (see docstring)."""
+    """Forward annual (v1) EPS consensus from FMP /stable. UNVALIDATED (see docstring)."""
 
     name = "fmp"
     validated = False  # flipped to True only after scripts/validate_live.py passes
@@ -52,14 +58,19 @@ class FMPForwardEstimateSource(ForwardEstimateSource):
         api_key: str,
         fiscal_calendars: dict[str, FiscalCalendar],
         base_url: str = DEFAULT_BASE_URL,
-        page_limit: int = 100,
+        page_limit: int = 10,
         max_pages: int = 10,
+        fetch_quarterly: bool = False,
     ) -> None:
         self.api_key = api_key
         self.fiscal_calendars = fiscal_calendars
         self.base_url = base_url.rstrip("/")
-        self.page_limit = page_limit
+        # Clamp to Starter's cap; the curve only spans ~7 FYs so one page suffices.
+        self.page_limit = min(page_limit, _STARTER_LIMIT_CAP)
         self.max_pages = max_pages
+        # Quarterly is Premium-gated; default OFF. Flip to True on a Premium plan
+        # to add true per-quarter estimates (no engine change needed).
+        self.fetch_quarterly = fetch_quarterly
 
     # --- network (untested here) ---------------------------------------------
     def _fetch(self, ticker: str, period: str) -> list[dict[str, Any]]:
@@ -106,9 +117,15 @@ class FMPForwardEstimateSource(ForwardEstimateSource):
         cal = self.fiscal_calendars.get(ticker)
         if cal is None:
             raise KeyError(f"No fiscal calendar configured for {ticker}")
-        q = self.parse_estimates(self._fetch(ticker, "quarter"), ticker, as_of, "quarter", cal)
-        a = self.parse_estimates(self._fetch(ticker, "annual"), ticker, as_of, "annual", cal)
-        return q + a
+        # v1: ANNUAL only (Starter). The forward quarters are derived from this
+        # multi-year annual curve downstream.
+        records = self.parse_estimates(self._fetch(ticker, "annual"), ticker, as_of, "annual", cal)
+        if self.fetch_quarterly:  # Premium plans only
+            records = (
+                self.parse_estimates(self._fetch(ticker, "quarter"), ticker, as_of, "quarter", cal)
+                + records
+            )
+        return records
 
     # --- parsing (pure; unit-tested against fixtures) ------------------------
     def parse_estimates(
