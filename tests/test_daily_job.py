@@ -170,43 +170,53 @@ def test_cik_enables_actual_subtraction(db_url: str) -> None:
     assert abs(true_pe - 25.0) > 1.0
 
 
-def test_as_of_date_uses_eastern_not_utc() -> None:
-    # Regression: the 10pm cron fires just past midnight UTC (e.g. 00:58 UTC = 20:58 ET).
-    # Using datetime.now(UTC).date() returns the NEXT calendar date, so yfinance gets
-    # start=June18 while Yahoo's end is still June17 -> "start after end" error.
-    # The fix: datetime.now(_MARKET_TZ).date() always returns the Eastern date.
-    #
-    # Simulate 2026-06-18T00:58:00 UTC = 2026-06-17T20:58:00 EDT.
-    from zoneinfo import ZoneInfo
+def _fake_market_as_of(fake_et_dt) -> "date":
+    """Call _market_as_of() with datetime.now patched to return fake_et_dt."""
+    import datetime as _dt
     from corridor.ingest import job as job_mod
 
-    utc_past_midnight = date(2026, 6, 18)   # what UTC gives (wrong)
-    eastern_same_evening = date(2026, 6, 17)  # what ET gives (right, market date)
-
-    # Patch datetime.now inside the job module to return a post-midnight-UTC instant.
-    utc_fake = timezone.utc
-    eastern_tz = ZoneInfo("America/New_York")
-
     class _FakeDatetime:
-        """datetime.now(_MARKET_TZ) must return the Eastern date, not the UTC date."""
         @staticmethod
         def now(tz=None):
-            # 00:58 UTC on June 18 = 20:58 EDT on June 17
-            if tz is not None and str(tz) == "America/New_York":
-                import datetime as _dt
-                return _dt.datetime(2026, 6, 17, 20, 58, 0, tzinfo=tz)
-            import datetime as _dt
-            return _dt.datetime(2026, 6, 18, 0, 58, 0, tzinfo=timezone.utc)
+            return fake_et_dt
 
     with patch.object(job_mod, "datetime", _FakeDatetime):
-        computed = job_mod.datetime.now(job_mod._MARKET_TZ).date()
+        return job_mod._market_as_of()
 
-    assert computed == eastern_same_evening, (
-        f"as_of should be Eastern date {eastern_same_evening}, got {computed} "
-        f"(UTC date was {utc_past_midnight}); start<=end would fail for yfinance"
-    )
-    # Confirm the Eastern date is strictly before the UTC date in this scenario.
-    assert computed < utc_past_midnight
+
+def test_market_as_of_post_et_midnight_before_close() -> None:
+    # Regression: 04:22 UTC = 00:22 ET on June 18 (Thursday).
+    # Market last closed June 17. Must return June 17, not June 18.
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+
+    et = ZoneInfo("America/New_York")
+    fake = _dt.datetime(2026, 6, 18, 0, 22, 0, tzinfo=et)  # 00:22 ET = 04:22 UTC
+    result = _fake_market_as_of(fake)
+    assert result == date(2026, 6, 17), f"Expected 2026-06-17, got {result}"
+
+
+def test_market_as_of_evening_cron() -> None:
+    # Normal cron: 22:00 ET on June 17 (Wednesday, after close).
+    # Market closed today at 16:00; as_of = June 17.
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+
+    et = ZoneInfo("America/New_York")
+    fake = _dt.datetime(2026, 6, 17, 22, 0, 0, tzinfo=et)
+    result = _fake_market_as_of(fake)
+    assert result == date(2026, 6, 17), f"Expected 2026-06-17, got {result}"
+
+
+def test_market_as_of_monday_midnight_skips_weekend() -> None:
+    # 00:22 ET on Monday June 22 (before close): rolls back to Friday June 19.
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+
+    et = ZoneInfo("America/New_York")
+    fake = _dt.datetime(2026, 6, 22, 0, 22, 0, tzinfo=et)  # Monday pre-close
+    result = _fake_market_as_of(fake)
+    assert result == date(2026, 6, 19), f"Expected 2026-06-19 (Friday), got {result}"
 
 
 def test_yfinance_retries_on_empty_then_succeeds() -> None:

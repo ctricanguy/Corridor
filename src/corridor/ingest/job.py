@@ -21,13 +21,16 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time as _time, timedelta
 from zoneinfo import ZoneInfo
 
-# Market data (yfinance/Yahoo) is keyed by US/Eastern calendar dates. Using UTC
-# would yield tomorrow's date after 20:00 ET (midnight UTC) and produce a
-# start > end error because Yahoo's end is still the prior trading day.
+# Market data (yfinance/Yahoo) is keyed by US/Eastern trading-day dates.
+# Use _market_as_of() — not just datetime.now(UTC).date() — to compute the
+# valuation date: it returns the most recent COMPLETED equity trading day,
+# rolling back past midnight-to-close ET and over weekends.
 _MARKET_TZ = ZoneInfo("America/New_York")
+# NYSE/Nasdaq regular session closes 16:00 ET; allow 30 min for data to settle.
+_MARKET_CLOSE_ET = _time(16, 30)
 from typing import TYPE_CHECKING, Any
 
 from ..constants import (
@@ -412,6 +415,35 @@ def check_label_alignment(
     return AlignmentReport(window_start_fy, anchor_fy, trailing_years, in_window, older)
 
 
+def _market_as_of() -> date:
+    """Most recent completed US equity trading day as of now.
+
+    Pinned to US/Eastern throughout.  Two adjustments:
+
+    1. **Before-close rollback** — if the current ET time is before 16:30 ET,
+       today's session has not closed (or its bars haven't settled).  Roll back
+       one calendar day.  This covers midnight-to-4:30pm ET, including the
+       window where UTC is already tomorrow but ET is still today-without-data.
+
+    2. **Weekend skip** — roll back over Saturday/Sunday until we land on a
+       weekday (Friday for a Sunday/Monday-early-morning run).  Holidays that
+       fall on weekdays are not filtered here; yfinance will return zero bars
+       and the daily job records a price_gap, which is correct.
+
+    The cron fires at 22:00 local (Pi is typically Eastern, so 22:00 ET): well
+    past 16:30, so adjustment 1 never applies.  Adjustment 2 never applies
+    either because the cron is weekdays-only.  Both adjustments exist for
+    manual runs and guard against the midnight-to-open window.
+    """
+    now_et = datetime.now(_MARKET_TZ)
+    candidate = now_et.date()
+    if now_et.time() < _MARKET_CLOSE_ET:
+        candidate -= timedelta(days=1)
+    while candidate.weekday() >= 5:   # 5 = Saturday, 6 = Sunday
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 # --- persistence ------------------------------------------------------------
 def _insert_or_ignore(
     session: Session, model: Any, values: dict[str, Any], index_elements: list[str]
@@ -459,7 +491,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
         ValuationSnapshot,
     )
 
-    as_of = as_of or datetime.now(_MARKET_TZ).date()
+    as_of = as_of or _market_as_of()
     cals = config.fiscal_calendars()
     thresholds = config.thresholds
     unsupported = config.unsupported_tickers
