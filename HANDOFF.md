@@ -6,7 +6,7 @@
 > decisions** (do not relitigate them), current state, and the traps that already bit us.
 
 **Current branch:** `claude/great-volta-w03vwf` (all work lands here; never push elsewhere without asking).
-**Status at handoff:** Stages 0–2 + CIK resolver done. Timezone + FY-gate bugs fixed (2026-06-18). **95 passed, 1 skipped; ruff + mypy clean.**
+**Status at handoff:** Stages 0–2 + CIK resolver done. Timezone + FY-gate bugs fixed (2026-06-18/19). **97 passed, 1 skipped; ruff + mypy clean.**
 Next up: **Stage 4 (visualization/dashboard)**, then **Stage 5 (backtest)**. Do **not** start Stage 4 without the user's go-ahead.
 
 ---
@@ -307,6 +307,15 @@ a strong, specific reason.
   `period_end_date` — it saw two distinct entries and picked the comparative alone → drift fired.
   Fix: gate now keys by DATE-DERIVED label (same as `actuals_from_fundamentals`) so both entries
   collapse to one label and the earliest-filed (original) wins.
+  (c) *Comparative-only entry, no original in companyfacts* (AMD live case, fixed 2026-06-19):
+  some companies' EDGAR companyfacts entries for certain quarters have no `start` date field.
+  `_classify(None, end)` returns None → the original entry is excluded from `fundamentals`
+  entirely. The only surviving entry is the COMPARATIVE from the next year's 10-Q (which has
+  a proper start/end pair but carries fy=year+1 drift). SEC rules require large accelerated
+  filers to file a 10-Q within 40 days of period-end; any entry filed >150 days after period_end
+  can ONLY be a comparative. The gate now marks these as benign (agree=True). A genuine
+  fy_end_month misconfiguration shows drift on the ORIGINAL filing (filed <40 days) and is
+  still surfaced.
   (b) *Old-EDGAR-data-only ticker* (e.g. GOOGL if no recent quarterly EPS tag in companyfacts):
   the old gate anchored its window to `max(EDGAR_entries)`, which could be FY2015, making FY2014
   entries appear "in-window". Fix: gate now anchors window to `fiscal_year_of(as_of, cal)` when

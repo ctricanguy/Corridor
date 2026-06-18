@@ -62,16 +62,34 @@ def test_original_and_comparative_align_via_earliest_filed() -> None:
     assert actuals == {"FY2026Q1": 0.85}
 
 
-def test_drift_is_surfaced_when_only_comparative_seen() -> None:
-    # If only the drifted comparative is present, the gate SURFACES the drift...
-    comparative = _q1_fy2026("FY2027Q1", filed=date(2026, 5, 28))
+def test_comparative_only_long_lag_is_treated_as_benign() -> None:
+    # AMD live case: original 10-Q entry has no start date in companyfacts -> _classify
+    # excludes it -> only the comparative from the next year's 10-Q survives. That entry
+    # is filed >150 days after period_end and carries the expected +1yr drift. The gate
+    # must mark it benign (agree=True) — the date-derived label and EPS value are correct.
+    comparative = _q1_fy2026("FY2027Q1", filed=date(2026, 5, 28))  # 396 days after period_end
     report = check_label_alignment([comparative], NVDA_CAL)
-    assert not report.aligned
-    assert report.in_window[0].edgar_label == "FY2027Q1"
-    assert report.in_window[0].date_label == "FY2026Q1"
-    # ...but the actual is STILL keyed to the correct fiscal year by date.
+    # Filed 2026-05-28, period_end 2025-04-27 -> lag 396 days > 150 -> benign comparative.
+    assert report.in_window[0].agree  # treated as benign, not surfaced as drift
+    # Actuals are still correctly keyed by date regardless.
     _d, actuals = actuals_from_fundamentals([comparative], NVDA_CAL)
     assert actuals == {"FY2026Q1": 0.85}
+
+
+def test_genuine_drift_on_recent_filing_is_still_surfaced() -> None:
+    # A wrong fy_end_month produces drift on the ORIGINAL (recently filed) entry.
+    # Filed 30 days after period_end -> lag <= 150 days -> NOT a benign comparative ->
+    # gate must still surface it so the config error is caught.
+    wrong_label_original = FundamentalRecord(
+        ticker="NVDA", cik="1045810", fiscal_period="FY2026Q1",
+        period_end_date=date(2025, 4, 27), filed_date=date(2025, 5, 27),  # 30 days later
+        metric="eps_diluted", value=0.85, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2027Q1",  # drifted label on ORIGINAL
+    )
+    report = check_label_alignment([wrong_label_original], NVDA_CAL)
+    # Lag = 30 days <= 150 -> NOT benign comparative -> drift surfaced.
+    assert not report.in_window[0].agree
+    assert not report.aligned
 
 
 def test_gate_scopes_to_recent_window_and_exempts_old_drift() -> None:
@@ -95,6 +113,51 @@ def test_actual_ties_to_fmp_annual_by_date_bounds() -> None:
     fy = fiscal_year_of(date(2026, 1, 25), NVDA_CAL)  # FMP annual FY2026 end
     start, end = fiscal_year_bounds(fy, NVDA_CAL)
     assert start <= date(2025, 4, 27) <= end  # the Q1 actual is inside FY2026
+
+
+def test_amd_no_start_date_comparative_only_no_drift_warning() -> None:
+    # AMD live case: original Q2/Q3 2024 and Q1 2025 companyfacts entries have no start
+    # date -> _classify(None, end) returns None -> excluded from fundamentals. Only the
+    # comparative from the next year's 10-Q survives (has start/end pair, filed ~1yr
+    # later). These comparatives carry fy=year+1 drift but are benign: value and
+    # period_end are correct; date-derived label is definitively correct for a Dec-FY co.
+    AMD_CAL = FiscalCalendar(fy_end_month=12)
+    as_of = date(2026, 6, 18)
+    # Only comparative available for each quarter (original excluded by _classify):
+    amd_q2_comparative = FundamentalRecord(
+        ticker="AMD", cik="0000002488", fiscal_period="FY2024Q2",
+        period_end_date=date(2024, 6, 29), filed_date=date(2025, 7, 29),  # 395 days
+        metric="eps_diluted", value=0.69, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2025Q2",
+    )
+    amd_q3_comparative = FundamentalRecord(
+        ticker="AMD", cik="0000002488", fiscal_period="FY2024Q3",
+        period_end_date=date(2024, 9, 28), filed_date=date(2025, 10, 28),  # 395 days
+        metric="eps_diluted", value=0.92, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2025Q3",
+    )
+    amd_q1_2025_comparative = FundamentalRecord(
+        ticker="AMD", cik="0000002488", fiscal_period="FY2025Q1",
+        period_end_date=date(2025, 3, 29), filed_date=date(2026, 4, 29),  # 396 days
+        metric="eps_diluted", value=1.12, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2026Q1",
+    )
+    report = check_label_alignment(
+        [amd_q2_comparative, amd_q3_comparative, amd_q1_2025_comparative],
+        AMD_CAL, trailing_years=3, as_of=as_of,
+    )
+    # All three in-window quarters should be benign (no warning fired).
+    assert all(a.agree for a in report.in_window), (
+        f"Expected all in-window entries benign, got: "
+        f"{[(a.date_label, a.edgar_label, a.agree) for a in report.in_window]}"
+    )
+    # Actuals still keyed correctly by date-derived labels.
+    _d, actuals = actuals_from_fundamentals(
+        [amd_q2_comparative, amd_q3_comparative, amd_q1_2025_comparative], AMD_CAL
+    )
+    assert actuals.get("FY2024Q2") == pytest.approx(0.69)
+    assert actuals.get("FY2024Q3") == pytest.approx(0.92)
+    assert actuals.get("FY2025Q1") == pytest.approx(1.12)
 
 
 def test_52_53_week_boundary_shift_does_not_fire_false_in_window_drift() -> None:
@@ -153,10 +216,11 @@ def test_old_edgar_data_only_does_not_produce_false_in_window_drift() -> None:
     )
     as_of = date(2026, 6, 18)
 
-    # WITHOUT as_of: anchor = max(aligns) = FY2014 -> window_start = 2012; entry is in-window.
+    # WITHOUT as_of: anchor = max(aligns) = FY2014 -> window_start = 2012; entry is in-window,
+    # but it's a comparative-only (lag 394 days > 150) -> treated as benign even here.
     report_no_asof = check_label_alignment([old_comparative], GOOGL_CAL, trailing_years=3)
     assert report_no_asof.anchor_fy == 2014
-    assert len(report_no_asof.in_window) == 1 and not report_no_asof.in_window[0].agree
+    assert len(report_no_asof.in_window) == 1 and report_no_asof.in_window[0].agree
 
     # WITH as_of: anchor = FY2026 -> window_start = 2024; entry goes to older (exempt).
     report_with_asof = check_label_alignment([old_comparative], GOOGL_CAL,

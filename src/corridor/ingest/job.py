@@ -352,8 +352,20 @@ def check_label_alignment(
     most recent EDGAR entry, which can misclassify very old quarters as in-window for
     tickers whose EDGAR companyfacts lacks recent quarterly entries (e.g. GOOGL if only
     old entries are available). Passing ``as_of`` guarantees the window covers the last N
-    fiscal years relative to today. This also still catches a genuinely wrong
-    ``fy_end_month``, since every period's date label would disagree with EDGAR's label.
+    fiscal years relative to today.
+
+    COMPARATIVE-ONLY entries: some companies (e.g. AMD) file EDGAR companyfacts entries
+    without a ``start`` date for certain quarters. ``_classify`` requires a start date to
+    compute the period span, so those entries are excluded from ``fundamentals`` entirely.
+    The only surviving entry for that quarter is then the comparative that appeared in the
+    NEXT year's 10-Q (which does have a start/end pair). That entry carries the expected
+    +1yr fy drift and is filed >150 days after the period_end. Since SEC large-accelerated-
+    filer rules require a 10-Q within 40 days of period-end, any entry filed more than
+    150 days after its period_end can only be a comparative — the drift is expected and
+    the date-derived label (used for actual subtraction) is definitively correct. Such
+    entries are marked ``agree=True`` (benign). A genuine fy_end_month misconfiguration
+    produces drift on ORIGINAL filings (filed <40 days after period-end) and would still
+    be surfaced.
     """
     # Key by DATE-DERIVED label — matches actuals_from_fundamentals. Entries for the same
     # quarter with slightly different period_end dates (52/53-week boundary shift) collapse
@@ -372,8 +384,17 @@ def check_label_alignment(
     for date_label, f in sorted(original.items(),
                                 key=lambda kv: (kv[1].period_end_date or date(1900, 1, 1), kv[0])):
         edgar_label = f.source_fiscal_period or ""
+        labels_match = edgar_label == date_label
+        # Comparative-only: original entry absent from companyfacts (no start date ->
+        # _classify excluded it). The surviving entry is a comparative filed >150 days
+        # after period_end — drift is expected, computation is correct.
+        is_benign_comparative = (
+            not labels_match
+            and f.period_end_date is not None
+            and (f.filed_date - f.period_end_date).days > 150
+        )
         aligns.append(LabelAlignment(f.period_end_date, edgar_label, date_label,
-                                     edgar_label == date_label))
+                                     labels_match or is_benign_comparative))
 
     if not aligns:
         return AlignmentReport(None, None, trailing_years, [], [])
