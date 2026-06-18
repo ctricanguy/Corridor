@@ -6,7 +6,7 @@
 > decisions** (do not relitigate them), current state, and the traps that already bit us.
 
 **Current branch:** `claude/great-volta-w03vwf` (all work lands here; never push elsewhere without asking).
-**Status at handoff:** Stages 0–2 + CIK resolver done. Timezone bug fixed (2026-06-18). **93 passed, 1 skipped; ruff + mypy clean.**
+**Status at handoff:** Stages 0–2 + CIK resolver done. Timezone + FY-gate bugs fixed (2026-06-18). **95 passed, 1 skipped; ruff + mypy clean.**
 Next up: **Stage 4 (visualization/dashboard)**, then **Stage 5 (backtest)**. Do **not** start Stage 4 without the user's go-ahead.
 
 ---
@@ -205,8 +205,12 @@ a strong, specific reason.
 
 4. **Certified NVDA True P/E ≈ 21.47** (flat derivation, gate-aligned, actuals subtracted via the
    CIK path). It's the canary: **if a change moves NVDA's number off ~21.47 without a clear
-   reason, something broke.** (Note: WITHOUT the CIK fix the job stored ~25 = annual/4 — biased;
-   that's why the CIK resolver + `engine_version` bump exist, see below.)
+   reason, something broke.** After the first clean live run (2026-06-18) it read 21.19 — this
+   is DATA FRESHNESS (new price + updated estimates), not a calc change. The canary is a
+   DIRECTION check (no regression), not a fixed decimal. Accept small daily drift as normal;
+   investigate if it moves > ~1-2 points without a known reason.
+   (Note: WITHOUT the CIK fix the job stored ~25 = annual/4 — biased; that's why the CIK
+   resolver + `engine_version` bump exist, see below.)
 
 5. **FK self-seeding.** `run_daily` UPSERTS the parent `securities` row before any child snapshot
    insert. Do **not** assume `init_db` seeded securities (it doesn't — the seeding lives in
@@ -296,6 +300,23 @@ a strong, specific reason.
 - **Stage discipline.** This project advanced one stage at a time with an explicit review pause at
   the end of each. Show the user the output (for live things: a synthetic `--demo` + the script to
   run), then STOP and wait for go-ahead. Do not one-shot multiple stages.
+- **FY-label alignment gate: 52/53-week boundary shifts and old-EDGAR-data false positives (fixed 2026-06-18).**
+  Two classes of false in-window drift:
+  (a) *52/53-week fiscal year boundary shift*: AMD/AVGO's original 10-Q and comparative entry for the
+  same quarter can have period_end dates that differ by 1-2 days. The old gate keyed by raw
+  `period_end_date` — it saw two distinct entries and picked the comparative alone → drift fired.
+  Fix: gate now keys by DATE-DERIVED label (same as `actuals_from_fundamentals`) so both entries
+  collapse to one label and the earliest-filed (original) wins.
+  (b) *Old-EDGAR-data-only ticker* (e.g. GOOGL if no recent quarterly EPS tag in companyfacts):
+  the old gate anchored its window to `max(EDGAR_entries)`, which could be FY2015, making FY2014
+  entries appear "in-window". Fix: gate now anchors window to `fiscal_year_of(as_of, cal)` when
+  `as_of` is provided (always the case from `run_daily`). Old entries go to `older` (exempt).
+  **The underlying True P/Es were NOT affected** — `actuals_from_fundamentals` uses date-derived
+  dedup and was correct throughout. The gate warnings were false alarms only.
+  Regression tests: `test_fiscal_alignment.py::test_52_53_week_boundary_shift_...` and
+  `test_old_edgar_data_only_does_not_produce_false_in_window_drift`.
+- **TSLA triple-digit True P/E is REAL.** Tesla legitimately trades at high forward multiples.
+  Do not "fix" it. The pipeline is computing correctly.
 - **UTC/Eastern timezone gotcha (price fetch).** The Pi cron fires at 22:00 local; if the Pi is in
   a timezone where 22:00 local is past midnight UTC (e.g. ET = UTC-4, so 22:00 ET = 02:00 UTC),
   then `datetime.now(UTC).date()` returns the NEXT calendar day. yfinance is then given
@@ -315,5 +336,7 @@ a strong, specific reason.
    `valuation_snapshots`. Then `engine/corridor.py` / `engine/signals.py` / `engine/peg.py` read
    the accumulated snapshots; `scripts/research.py` renders them.
 3. The certified canary: NVDA True P/E ≈ **21.47** (flat, gate-aligned, actuals subtracted).
+   Daily drift of a fraction is data freshness — only investigate if it moves > ~1-2 points unexplained.
+   TSLA triple-digit True P/E is REAL (Tesla legitimately trades at high multiples); not a bug.
 4. When you need live numbers, write the code + a `--demo`/fixture test, and ask the user to run
    the live script on the Pi and paste the result. Never assume you can fetch.

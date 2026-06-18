@@ -97,6 +97,75 @@ def test_actual_ties_to_fmp_annual_by_date_bounds() -> None:
     assert start <= date(2025, 4, 27) <= end  # the Q1 actual is inside FY2026
 
 
+def test_52_53_week_boundary_shift_does_not_fire_false_in_window_drift() -> None:
+    # AMD / AVGO live case: original 10-Q and comparative in a later 10-Q report the
+    # SAME quarter but with period_end dates that differ by 1-2 days (52/53-week FY
+    # boundary shift). The old gate (keyed by raw period_end) saw two distinct entries
+    # and picked the comparative alone -> false drift. The fixed gate (keyed by
+    # date-derived label) collapses both to the same label and picks the earliest-filed
+    # (the original) -> no drift.
+    AMD_CAL = FiscalCalendar(fy_end_month=12)  # calendar-year AMD
+    # Original Q2 2024 10-Q filed Aug 2024: period ended 2024-06-30 (last Saturday)
+    original_q2 = FundamentalRecord(
+        ticker="AMD", cik="0000002488", fiscal_period="FY2024Q2",
+        period_end_date=date(2024, 6, 30), filed_date=date(2024, 8, 1),
+        metric="eps_diluted", value=0.69, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2024Q2",
+    )
+    # Comparative in Q2 2025 10-Q filed Jul 2025: same quarter, period ended 2024-06-29
+    # (1-day shift), EDGAR fy drifted to 2025.
+    comparative_q2 = FundamentalRecord(
+        ticker="AMD", cik="0000002488", fiscal_period="FY2024Q2",
+        period_end_date=date(2024, 6, 29), filed_date=date(2025, 7, 29),
+        metric="eps_diluted", value=0.69, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2025Q2",
+    )
+    as_of = date(2026, 6, 18)
+    report = check_label_alignment([original_q2, comparative_q2], AMD_CAL,
+                                   trailing_years=3, as_of=as_of)
+    # FY2024 is in-window (anchor=2026, start=2024); gate must agree (no false drift).
+    in_w_labels = {a.date_label for a in report.in_window}
+    assert "FY2024Q2" in in_w_labels
+    q2_align = next(a for a in report.in_window if a.date_label == "FY2024Q2")
+    assert q2_align.agree, (
+        f"Gate should agree for FY2024Q2 (original filing picked), "
+        f"but got edgar_label={q2_align.edgar_label!r}"
+    )
+    assert report.aligned or len(report.in_window) == 1  # at least Q2 present and agrees
+
+    # Actuals also correct regardless of the date-shift.
+    _d, actuals = actuals_from_fundamentals([original_q2, comparative_q2], AMD_CAL)
+    assert actuals.get("FY2024Q2") == pytest.approx(0.69)
+
+
+def test_old_edgar_data_only_does_not_produce_false_in_window_drift() -> None:
+    # GOOGL live case: if EDGAR companyfacts returns only old quarterly entries (e.g.
+    # the continuing-ops EPS tag is absent for recent years), the anchor derived from
+    # max(aligns) is very old (e.g. 2015). That puts FY2014Q3 in-window (2014 >= 2013)
+    # and the drift fires for a 12-year-old comparative. With as_of anchoring the window
+    # covers the actual last 3 fiscal years, so the old entry goes to older (exempt).
+    GOOGL_CAL = FiscalCalendar(fy_end_month=12)
+    old_comparative = FundamentalRecord(
+        ticker="GOOGL", cik="0001652044", fiscal_period="FY2014Q3",
+        period_end_date=date(2014, 9, 30), filed_date=date(2015, 10, 29),  # filed in 2015 10-Q
+        metric="eps_diluted", value=7.35, unit="USD/shares", form="10-Q",
+        source="edgar", source_fiscal_period="FY2015Q3",  # drifted
+    )
+    as_of = date(2026, 6, 18)
+
+    # WITHOUT as_of: anchor = max(aligns) = FY2014 -> window_start = 2012; entry is in-window.
+    report_no_asof = check_label_alignment([old_comparative], GOOGL_CAL, trailing_years=3)
+    assert report_no_asof.anchor_fy == 2014
+    assert len(report_no_asof.in_window) == 1 and not report_no_asof.in_window[0].agree
+
+    # WITH as_of: anchor = FY2026 -> window_start = 2024; entry goes to older (exempt).
+    report_with_asof = check_label_alignment([old_comparative], GOOGL_CAL,
+                                             trailing_years=3, as_of=as_of)
+    assert report_with_asof.anchor_fy == 2026 and report_with_asof.window_start_fy == 2024
+    assert len(report_with_asof.in_window) == 0
+    assert len(report_with_asof.older) == 1
+
+
 def test_drifted_actual_subtracts_from_correct_fy_in_derivation() -> None:
     # April-2026 quarter (FY2027Q1) with a drifted comparative source (FY2028Q1).
     drifted = FundamentalRecord(

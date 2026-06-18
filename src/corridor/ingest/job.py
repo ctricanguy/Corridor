@@ -335,37 +335,59 @@ class AlignmentReport:
 
 
 def check_label_alignment(
-    fundamentals: list[FundamentalRecord], cal: FiscalCalendar, trailing_years: int = 3
+    fundamentals: list[FundamentalRecord], cal: FiscalCalendar, trailing_years: int = 3,
+    as_of: date | None = None,
 ) -> AlignmentReport:
     """Compare EDGAR's OWN fy/fp label to our date-derived label, per period, SCOPED.
 
-    Anchored to the ORIGINAL filing (earliest filed) for each period_end so the +1yr
-    COMPARATIVE artifact is ignored. Partitioned into a trailing ``trailing_years``
-    fiscal-year window (anchored on the most recent reported quarter) and older
-    quarters: only the in-window quarters drive ``aligned``; older ones are exempt and
-    reported separately. This also still catches a genuinely wrong ``fy_end_month``.
+    Anchored to the ORIGINAL filing (earliest filed) for each DATE-DERIVED fiscal label
+    (not raw period_end) so the +1yr COMPARATIVE artifact is ignored. Using the
+    date-derived label as the dedup key rather than the raw period_end date also handles
+    52/53-week fiscal year boundary shifts: original and comparative filings for the same
+    quarter can have period_end dates that differ by 1-2 days (e.g. AMD Q2 2024 ends
+    2024-06-30 in the original 10-Q but 2024-06-29 in the comparative) — both map to
+    the same date-derived label, so the original filing always wins.
+
+    Window is anchored to ``as_of`` when provided. Without it the anchor defaults to the
+    most recent EDGAR entry, which can misclassify very old quarters as in-window for
+    tickers whose EDGAR companyfacts lacks recent quarterly entries (e.g. GOOGL if only
+    old entries are available). Passing ``as_of`` guarantees the window covers the last N
+    fiscal years relative to today. This also still catches a genuinely wrong
+    ``fy_end_month``, since every period's date label would disagree with EDGAR's label.
     """
-    original: dict[date, FundamentalRecord] = {}
+    # Key by DATE-DERIVED label — matches actuals_from_fundamentals. Entries for the same
+    # quarter with slightly different period_end dates (52/53-week boundary shift) collapse
+    # to one label; earliest-filed wins.
+    original: dict[str, FundamentalRecord] = {}
     for f in fundamentals:
         src = f.source_fiscal_period
         if src is None or "Q" not in src or f.period_end_date is None or f.filed_date is None:
             continue
-        cur = original.get(f.period_end_date)
-        if cur is None or (cur.filed_date is not None and f.filed_date < cur.filed_date):
-            original[f.period_end_date] = f
+        date_label = label_period(f.period_end_date, cal)
+        cur = original.get(date_label)
+        if cur is None or f.filed_date < cur.filed_date:
+            original[date_label] = f
 
     aligns: list[LabelAlignment] = []
-    for end, f in sorted(original.items()):
-        date_label = label_period(end, cal)
+    for date_label, f in sorted(original.items(),
+                                key=lambda kv: (kv[1].period_end_date or date(1900, 1, 1), kv[0])):
         edgar_label = f.source_fiscal_period or ""
-        aligns.append(LabelAlignment(end, edgar_label, date_label, edgar_label == date_label))
+        aligns.append(LabelAlignment(f.period_end_date, edgar_label, date_label,
+                                     edgar_label == date_label))
 
     if not aligns:
         return AlignmentReport(None, None, trailing_years, [], [])
-    anchor_fy = max(fiscal_year_of(a.period_end, cal) for a in aligns)
+    if as_of is not None:
+        anchor_fy = fiscal_year_of(as_of, cal)
+    else:
+        anchor_fy = max(
+            fiscal_year_of(a.period_end, cal) for a in aligns if a.period_end is not None
+        )
     window_start_fy = anchor_fy - (trailing_years - 1)
-    in_window = [a for a in aligns if fiscal_year_of(a.period_end, cal) >= window_start_fy]
-    older = [a for a in aligns if fiscal_year_of(a.period_end, cal) < window_start_fy]
+    in_window = [a for a in aligns
+                 if a.period_end is not None and fiscal_year_of(a.period_end, cal) >= window_start_fy]
+    older = [a for a in aligns
+             if a.period_end is None or fiscal_year_of(a.period_end, cal) < window_start_fy]
     return AlignmentReport(window_start_fy, anchor_fy, trailing_years, in_window, older)
 
 
@@ -471,7 +493,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
             cik = cik_by_ticker.get(ticker) or spec.cik  # resolver wins; config is the fallback
             fundamentals = _safe_fundamentals(fundamentals_source, ticker, cik)
             edgar_dates, reported_actuals = actuals_from_fundamentals(fundamentals, cal)
-            report = check_label_alignment(fundamentals, cal, trailing_years=align_years)
+            report = check_label_alignment(fundamentals, cal, trailing_years=align_years, as_of=as_of)
             for la in report.in_window:
                 if not la.agree:  # IN-WINDOW drift is a real problem (e.g. bad fy_end_month)
                     logger.warning("%s FY-label drift IN GATE WINDOW: EDGAR %s vs date %s (end %s)",
