@@ -175,6 +175,8 @@ def load_annual_estimates(ticker: str) -> pd.DataFrame:
     today = pd.Timestamp.now().normalize()
     return df[df["period_end_date"] > today].sort_values("period_end_date").reset_index(drop=True)
 
+
+def load_watchlist_latest() -> pd.DataFrame:
     """One row per ticker: the most-recent certified valuation snapshot.
 
     Used for the watchlist overview table.
