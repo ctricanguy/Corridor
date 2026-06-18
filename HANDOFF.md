@@ -6,7 +6,7 @@
 > decisions** (do not relitigate them), current state, and the traps that already bit us.
 
 **Current branch:** `claude/great-volta-w03vwf` (all work lands here; never push elsewhere without asking).
-**Status at handoff:** Stages 0–2 + CIK resolver done. **92 passed, 1 skipped; ruff + mypy clean.**
+**Status at handoff:** Stages 0–2 + CIK resolver done. Timezone bug fixed (2026-06-18). **93 passed, 1 skipped; ruff + mypy clean.**
 Next up: **Stage 4 (visualization/dashboard)**, then **Stage 5 (backtest)**. Do **not** start Stage 4 without the user's go-ahead.
 
 ---
@@ -296,6 +296,14 @@ a strong, specific reason.
 - **Stage discipline.** This project advanced one stage at a time with an explicit review pause at
   the end of each. Show the user the output (for live things: a synthetic `--demo` + the script to
   run), then STOP and wait for go-ahead. Do not one-shot multiple stages.
+- **UTC/Eastern timezone gotcha (price fetch).** The Pi cron fires at 22:00 local; if the Pi is in
+  a timezone where 22:00 local is past midnight UTC (e.g. ET = UTC-4, so 22:00 ET = 02:00 UTC),
+  then `datetime.now(UTC).date()` returns the NEXT calendar day. yfinance is then given
+  `start=June18` while Yahoo's backend end date is still `June17` → "start date cannot be after
+  end date" for every ticker. **Fix (applied 2026-06-18):** `run_daily` computes `as_of` via
+  `datetime.now(_MARKET_TZ).date()` where `_MARKET_TZ = ZoneInfo("America/New_York")`. Market
+  data is always keyed by US/Eastern dates; pin there throughout. Regression test:
+  `test_daily_job.py::test_as_of_date_uses_eastern_not_utc`.
 
 ---
 

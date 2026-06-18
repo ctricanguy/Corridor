@@ -6,7 +6,8 @@ fresh DB, and yfinance returning zero bars — and lock in the fixes.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timezone, timedelta
+from unittest.mock import patch
 
 import pytest
 
@@ -167,6 +168,45 @@ def test_cik_enables_actual_subtraction(db_url: str) -> None:
     # sum = 1.20*3 + 1.50 = 5.10 -> 120/5.10 = 23.53 (NOT the old 120/4.80 = 25.0).
     assert true_pe == pytest.approx(120.0 / 5.10)
     assert abs(true_pe - 25.0) > 1.0
+
+
+def test_as_of_date_uses_eastern_not_utc() -> None:
+    # Regression: the 10pm cron fires just past midnight UTC (e.g. 00:58 UTC = 20:58 ET).
+    # Using datetime.now(UTC).date() returns the NEXT calendar date, so yfinance gets
+    # start=June18 while Yahoo's end is still June17 -> "start after end" error.
+    # The fix: datetime.now(_MARKET_TZ).date() always returns the Eastern date.
+    #
+    # Simulate 2026-06-18T00:58:00 UTC = 2026-06-17T20:58:00 EDT.
+    from zoneinfo import ZoneInfo
+    from corridor.ingest import job as job_mod
+
+    utc_past_midnight = date(2026, 6, 18)   # what UTC gives (wrong)
+    eastern_same_evening = date(2026, 6, 17)  # what ET gives (right, market date)
+
+    # Patch datetime.now inside the job module to return a post-midnight-UTC instant.
+    utc_fake = timezone.utc
+    eastern_tz = ZoneInfo("America/New_York")
+
+    class _FakeDatetime:
+        """datetime.now(_MARKET_TZ) must return the Eastern date, not the UTC date."""
+        @staticmethod
+        def now(tz=None):
+            # 00:58 UTC on June 18 = 20:58 EDT on June 17
+            if tz is not None and str(tz) == "America/New_York":
+                import datetime as _dt
+                return _dt.datetime(2026, 6, 17, 20, 58, 0, tzinfo=tz)
+            import datetime as _dt
+            return _dt.datetime(2026, 6, 18, 0, 58, 0, tzinfo=timezone.utc)
+
+    with patch.object(job_mod, "datetime", _FakeDatetime):
+        computed = job_mod.datetime.now(job_mod._MARKET_TZ).date()
+
+    assert computed == eastern_same_evening, (
+        f"as_of should be Eastern date {eastern_same_evening}, got {computed} "
+        f"(UTC date was {utc_past_midnight}); start<=end would fail for yfinance"
+    )
+    # Confirm the Eastern date is strictly before the UTC date in this scenario.
+    assert computed < utc_past_midnight
 
 
 def test_yfinance_retries_on_empty_then_succeeds() -> None:

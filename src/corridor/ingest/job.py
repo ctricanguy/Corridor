@@ -22,6 +22,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
+
+# Market data (yfinance/Yahoo) is keyed by US/Eastern calendar dates. Using UTC
+# would yield tomorrow's date after 20:00 ET (midnight UTC) and produce a
+# start > end error because Yahoo's end is still the prior trading day.
+_MARKET_TZ = ZoneInfo("America/New_York")
 from typing import TYPE_CHECKING, Any
 
 from ..constants import (
@@ -410,7 +416,7 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
         ValuationSnapshot,
     )
 
-    as_of = as_of or datetime.now(UTC).date()
+    as_of = as_of or datetime.now(_MARKET_TZ).date()
     cals = config.fiscal_calendars()
     thresholds = config.thresholds
     unsupported = config.unsupported_tickers
