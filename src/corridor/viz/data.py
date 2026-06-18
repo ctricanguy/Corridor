@@ -123,7 +123,58 @@ def load_overlay(ticker: str) -> dict[str, Any] | None:
         }
 
 
-def load_watchlist_latest() -> pd.DataFrame:
+def load_annual_estimates(ticker: str) -> pd.DataFrame:
+    """Latest annual EPS estimates per fiscal year for the forward projection line.
+
+    Returns future-only rows (period_end_date > today), sorted by period end.
+    Each row has: fiscal_period, period_end_date (datetime), value (annual EPS).
+    Empty DataFrame when no annual estimates exist.
+    """
+    from corridor.db.models import ForwardEstimateSnapshot
+    from sqlalchemy import func
+    import datetime as _dt
+
+    scope = _session()
+    with scope() as s:
+        latest_date = (
+            s.query(func.max(ForwardEstimateSnapshot.as_of_date))
+            .filter(
+                ForwardEstimateSnapshot.ticker == ticker,
+                ForwardEstimateSnapshot.period_type == "annual",
+                ForwardEstimateSnapshot.metric == "eps",
+            )
+            .scalar()
+        )
+        if latest_date is None:
+            return pd.DataFrame()
+        rows = (
+            s.query(ForwardEstimateSnapshot)
+            .filter(
+                ForwardEstimateSnapshot.ticker == ticker,
+                ForwardEstimateSnapshot.as_of_date == latest_date,
+                ForwardEstimateSnapshot.period_type == "annual",
+                ForwardEstimateSnapshot.metric == "eps",
+                ForwardEstimateSnapshot.period_end_date.isnot(None),
+            )
+            .order_by(ForwardEstimateSnapshot.period_end_date)
+            .all()
+        )
+        data = [
+            {
+                "fiscal_period": r.fiscal_period,
+                "period_end_date": r.period_end_date,
+                "value": r.value,
+                "as_of_date": r.as_of_date,
+            }
+            for r in rows
+        ]
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    df["period_end_date"] = pd.to_datetime(df["period_end_date"])
+    today = pd.Timestamp.now().normalize()
+    return df[df["period_end_date"] > today].sort_values("period_end_date").reset_index(drop=True)
+
     """One row per ticker: the most-recent certified valuation snapshot.
 
     Used for the watchlist overview table.

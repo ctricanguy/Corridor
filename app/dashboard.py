@@ -4,8 +4,9 @@ Run:
     .venv/bin/streamlit run app/dashboard.py
 
 Two views (sidebar nav):
-  • Per-company  — corridor / True P/E / PEG charts + signal badge + key stats
-  • Watchlist    — sortable overview table of all 10 names
+  • Per-company      — corridor / True P/E / PEG charts + signal badge + key stats
+                       + forward projection line on the corridor chart
+  • Watchlist        — PE-percentile heatmap bar chart + sortable detail table
 """
 
 from __future__ import annotations
@@ -13,14 +14,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make the src tree importable when launched from any working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pandas as pd
 import streamlit as st
 
-from corridor.viz.charts import corridor_chart, peg_chart, true_pe_chart
-from corridor.viz.data import load_universe, load_valuation_history, load_watchlist_latest
+from corridor.viz.charts import (
+    corridor_chart, peg_chart, true_pe_chart, watchlist_heatmap,
+)
+from corridor.viz.data import (
+    load_annual_estimates, load_universe,
+    load_valuation_history, load_watchlist_latest,
+)
 
 # ── page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -33,13 +38,13 @@ st.set_page_config(
 # ── shared helpers ─────────────────────────────────────────────────────────────
 
 _SIGNAL_COLORS = {
-    "hard_buy": ("#00C864", "⬆⬆ HARD BUY"),
-    "buy": ("#00A050", "⬆ BUY"),
-    "watch_cheap": ("#60C860", "👀 WATCH CHEAP"),
-    "hold": ("#888888", "— HOLD"),
-    "trim": ("#E07020", "⬇ TRIM"),
-    "hard_trim": ("#CC2020", "⬇⬇ HARD TRIM"),
-    "insufficient_history": ("#555555", "⏳ THIN HISTORY"),
+    "hard_buy":            ("#00C864", "⬆⬆ HARD BUY"),
+    "buy":                 ("#00A050", "⬆ BUY"),
+    "watch_cheap":         ("#60C860", "👀 WATCH CHEAP"),
+    "hold":                ("#888888", "— HOLD"),
+    "trim":                ("#E07020", "⬇ TRIM"),
+    "hard_trim":           ("#CC2020", "⬇⬇ HARD TRIM"),
+    "insufficient_history":("#555555", "⏳ THIN HISTORY"),
 }
 
 
@@ -60,18 +65,14 @@ def _signal_badge(signal: str | None) -> None:
 
 
 def _fmt_flag(val: bool | None, label: str) -> str:
-    if val:
-        return f"⚠ {label}"
-    return f"✓ {label}"
+    return f"⚠ {label}" if val else f"✓ {label}"
 
 
 def _pct(v: float | None) -> str:
     return f"{v:.1%}" if v is not None and pd.notna(v) else "—"
 
-
 def _f2(v: float | None) -> str:
     return f"{v:.2f}" if v is not None and pd.notna(v) else "—"
-
 
 def _money(v: float | None) -> str:
     return f"${v:,.2f}" if v is not None and pd.notna(v) else "—"
@@ -87,12 +88,12 @@ def company_view(ticker: str) -> None:
                    "Run `scripts/daily_refresh.py` to populate.")
         return
 
-    latest = df.iloc[-1]
-    as_of = df.index[-1].date()
+    latest       = df.iloc[-1]
+    as_of        = df.index[-1].date()
     history_days = int(latest.get("history_days") or 0)
-    is_thin = bool(latest.get("is_thin_history", True))
+    is_thin      = bool(latest.get("is_thin_history", True))
 
-    # ── header row ────────────────────────────────────────────────────────────
+    # ── header ────────────────────────────────────────────────────────────────
     h1, h2, h3 = st.columns([2, 1, 3])
     with h1:
         st.subheader(ticker)
@@ -102,8 +103,8 @@ def company_view(ticker: str) -> None:
     with h3:
         if is_thin:
             st.warning(
-                f"⚠ **Thin history** — corridor based on {history_days} days of real snapshots "
-                "(< 60). Bands are unstable. Accuracy improves as the daily job accumulates data."
+                f"⚠ **Thin history** — corridor based on {history_days}d of real snapshots "
+                "(target ≥ 60). Bands are unstable; accuracy improves each trading day."
             )
         elif latest.get("notes"):
             st.info(latest["notes"])
@@ -118,15 +119,18 @@ def company_view(ticker: str) -> None:
         "P/E percentile",
         f"{latest['pe_percentile']:.0f}th" if pd.notna(latest.get("pe_percentile")) else "—",
     )
+    peg_val = latest.get("forward_peg")
+    peg_supp = latest.get("peg_suppressed")
     c4.metric(
         "Forward PEG",
-        ("—" if latest.get("peg_suppressed") else _f2(latest.get("forward_peg")))
-        + (" (suppr.)" if latest.get("peg_suppressed") else ""),
+        ("suppr." if peg_supp else _f2(peg_val)),
+        help="Suppressed when growth rate < 2% (guardrail). Defer to corridor signal.",
     )
-    c5.metric("Coverage", _pct(latest.get("coverage_score")))
+    c5.metric("Coverage", _pct(latest.get("coverage_score")),
+              help="Fraction of 4Q sum from real quarterly estimates (1.0 = all real).")
     c6.metric("History", f"{history_days}d{'  ⚠' if is_thin else ''}")
 
-    # ── provenance + flags row ────────────────────────────────────────────────
+    # ── construction detail expander ─────────────────────────────────────────
     with st.expander("Construction detail + data flags", expanded=False):
         st.caption(f"**Method:** {latest.get('construction_method') or '—'}")
         f1, f2, f3 = st.columns(3)
@@ -137,14 +141,20 @@ def company_view(ticker: str) -> None:
     st.divider()
 
     # ── charts ────────────────────────────────────────────────────────────────
-    st.plotly_chart(corridor_chart(df, ticker), use_container_width=True)
+    # Load annual estimates for the projection line (empty → projection skipped)
+    annual_est = load_annual_estimates(ticker)
+
+    st.plotly_chart(
+        corridor_chart(df, ticker, annual_estimates=annual_est),
+        use_container_width=True,
+    )
     st.plotly_chart(true_pe_chart(df, ticker), use_container_width=True)
-    st.plotly_chart(peg_chart(df, ticker), use_container_width=True)
+    st.plotly_chart(peg_chart(df, ticker),     use_container_width=True)
 
     st.caption(
         "_Decision support for personal use only — not investment advice. "
-        "All charts reflect accumulated snapshot history; thin-history corridors "
-        "are explicitly flagged and should not be treated as deep distributions._"
+        "Projection line = historical band multiples × forward annual EPS estimates. "
+        "Thin-history corridors are explicitly flagged._"
     )
 
 
@@ -152,42 +162,46 @@ def company_view(ticker: str) -> None:
 
 def watchlist_view() -> None:
     st.subheader("Watchlist overview")
-    st.caption("Latest certified snapshot per ticker. Click column headers to sort.")
 
     df = load_watchlist_latest()
     if df.empty:
         st.warning("No data yet — run `scripts/daily_refresh.py`.")
         return
 
-    # Format for display
+    # ── heatmap bar chart (the at-a-glance scan) ──────────────────────────────
+    st.plotly_chart(watchlist_heatmap(df), use_container_width=True)
+
+    st.caption(
+        "Bar = True P/E percentile vs own snapshot history (all thin today — ≥ 60d needed "
+        "for stable corridors). ⚠ = thin history. Green < 20th = buy zone, "
+        "Red > 80th = trim zone."
+    )
+    st.divider()
+
+    # ── detail table ──────────────────────────────────────────────────────────
+    st.caption("Detail table — click column headers to sort.")
+
     disp = df.copy()
-    disp["signal"] = disp["signal"].fillna("—")
-    disp["True P/E"] = disp["true_pe"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
-    disp["P/E %ile"] = disp["pe_percentile"].map(
-        lambda v: f"{v:.0f}th" if pd.notna(v) else "—"
-    )
-    disp["Price"] = disp["price"].map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
-    disp["Corridor low"] = disp["corridor_low"].map(
-        lambda v: f"${v:,.2f}" if pd.notna(v) else "—"
-    )
-    disp["Corridor high"] = disp["corridor_high"].map(
-        lambda v: f"${v:,.2f}" if pd.notna(v) else "—"
-    )
-    disp["PEG"] = disp.apply(
+    disp["signal"]       = disp["signal"].fillna("—")
+    disp["True P/E"]     = disp["true_pe"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+    disp["P/E %ile"]     = disp["pe_percentile"].map(
+                               lambda v: f"{v:.0f}th" if pd.notna(v) else "—")
+    disp["Price"]        = disp["price"].map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
+    disp["Corr. low"]    = disp["corridor_low"].map(
+                               lambda v: f"${v:,.0f}" if pd.notna(v) else "—")
+    disp["Corr. high"]   = disp["corridor_high"].map(
+                               lambda v: f"${v:,.0f}" if pd.notna(v) else "—")
+    disp["PEG"]          = disp.apply(
         lambda r: "suppr." if r.get("peg_suppressed") else (
-            f"{r['forward_peg']:.2f}" if pd.notna(r.get("forward_peg")) else "—"
-        ),
+            f"{r['forward_peg']:.2f}" if pd.notna(r.get("forward_peg")) else "—"),
         axis=1,
     )
-    disp["Coverage"] = disp["coverage_score"].map(
-        lambda v: f"{v:.0%}" if pd.notna(v) else "—"
-    )
-    disp["History"] = disp["history_days"].map(
-        lambda v: f"{int(v)}d ⚠" if pd.notna(v) and v < 60 else (
-            f"{int(v)}d" if pd.notna(v) else "—"
-        )
-    )
-    disp["Flags"] = disp.apply(
+    disp["Coverage"]     = disp["coverage_score"].map(
+                               lambda v: f"{v:.0%}" if pd.notna(v) else "—")
+    disp["History"]      = disp["history_days"].map(
+        lambda v: (f"{int(v)}d ⚠" if pd.notna(v) and v < 60 else
+                   f"{int(v)}d"   if pd.notna(v) else "—"))
+    disp["Flags"]        = disp.apply(
         lambda r: " ".join(f for f, v in [
             ("W", r.get("window_divergence_flag")),
             ("P", r.get("price_disagreement_flag")),
@@ -197,21 +211,19 @@ def watchlist_view() -> None:
 
     show_cols = [
         "ticker", "as_of_date", "signal", "Price", "True P/E",
-        "P/E %ile", "Corridor low", "Corridor high", "PEG", "Coverage", "History", "Flags",
+        "P/E %ile", "Corr. low", "Corr. high", "PEG",
+        "Coverage", "History", "Flags",
     ]
     disp = disp[show_cols].rename(columns={"ticker": "Ticker", "as_of_date": "As of"})
 
-    # Color signal column via pandas Styler
     def _color_signal(val: str) -> str:
-        colors = {
-            "hard_buy": "background-color:#004020;color:#00E070",
-            "buy": "background-color:#003018;color:#00C864",
-            "watch_cheap": "background-color:#003018;color:#60C860",
-            "hold": "",
-            "trim": "background-color:#302000;color:#E07020",
-            "hard_trim": "background-color:#300000;color:#CC2020",
-        }
-        return colors.get(val, "")
+        return {
+            "hard_buy":   "background-color:#004020;color:#00E070",
+            "buy":        "background-color:#003018;color:#00C864",
+            "watch_cheap":"background-color:#003018;color:#60C860",
+            "trim":       "background-color:#302000;color:#E07020",
+            "hard_trim":  "background-color:#300000;color:#CC2020",
+        }.get(val, "")
 
     st.dataframe(
         disp.style.map(_color_signal, subset=["signal"]),
@@ -220,7 +232,7 @@ def watchlist_view() -> None:
     )
     st.caption(
         "Flags: W = window divergence, P = price source disagreement. "
-        "History ⚠ = thin (< 60 days)."
+        "Corridor low/high = band multiples × current NTM EPS (in price space)."
     )
 
 
