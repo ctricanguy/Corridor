@@ -580,6 +580,12 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
                 _insert_or_ignore(session, ValuationSnapshot,
                                   _val_row(result.valuation, config.engine_version, computed),
                                   ["ticker", "as_of_date", "engine_version"])
+                # UPDATE the computed columns even when the INSERT was a no-op
+                # (on_conflict_do_nothing silently skips re-runs on the same date,
+                # so existing rows would otherwise keep stale NULL computed values).
+                _update_computed_snapshot(
+                    session, ticker, as_of, config.engine_version, computed,
+                )
                 _log(session, IngestionLog, ticker, STATUS_OK,
                      result.valuation.construction_method, None, rows_written=1)
             else:
@@ -689,6 +695,38 @@ def _price_row(p: PriceRecord) -> dict[str, Any]:
         "split_ratio": p.split_ratio, "currency": p.currency, "source": p.source,
         "observation_timestamp": p.observation_timestamp,
     }
+
+
+def _update_computed_snapshot(
+    session: Any, ticker: str, as_of: date, engine_version: str, computed: dict[str, Any]
+) -> None:
+    """UPDATE the computed (derived) columns on an existing ValuationSnapshot row.
+
+    INSERT uses on_conflict_do_nothing, so a re-run on the same as_of date skips
+    the INSERT entirely — existing rows never had corridor/PEG/signal columns set
+    when those were added later.  This UPDATE fills them in idempotently. Only the
+    recomputable columns are touched; the core measured values (price, true_pe,
+    forward_eps_ntm) are never modified.
+    """
+    if not computed:
+        return
+    from ..db.models import ValuationSnapshot as VS
+
+    allowed = {
+        "history_days", "is_thin_history",
+        "pe_median", "pe_pctl_low", "pe_pctl_high",
+        "corridor_low", "corridor_high", "pe_percentile",
+        "forward_peg", "growth_rate", "growth_basis", "peg_suppressed",
+        "signal", "notes",
+    }
+    updates = {k: v for k, v in computed.items() if k in allowed}
+    if not updates:
+        return
+    session.query(VS).filter(
+        VS.ticker == ticker,
+        VS.as_of_date == as_of,
+        VS.engine_version == engine_version,
+    ).update(updates, synchronize_session=False)
 
 
 def _compute_corridor_peg_signal(

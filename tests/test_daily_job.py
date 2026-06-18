@@ -237,3 +237,35 @@ def test_yfinance_retries_on_empty_then_succeeds() -> None:
     recs = src.get_prices("NVDA")
     assert calls["n"] == 3  # retried until data arrived
     assert len(recs) == 1 and recs[0].close == 120.0
+
+
+def test_computed_columns_updated_on_same_day_rerun(db_url: str) -> None:
+    # Regression: on_conflict_do_nothing silently skips the INSERT when the row
+    # already exists (same as_of + engine_version).  A re-run should still UPDATE
+    # the computed columns (corridor, PEG, signal) via _update_computed_snapshot,
+    # so a re-run on the same date backfills NULL values from the first run.
+    from corridor.db import session_scope
+    from corridor.db.models import ValuationSnapshot
+
+    # First run: writes the row with the new code (PEG + signal populated).
+    with session_scope() as s:
+        _run(s)
+    with session_scope() as s:
+        row = s.query(ValuationSnapshot).filter_by(ticker="NVDA").one()
+        # history_days = 1 (today's point is the only one)
+        assert row.history_days == 1, f"expected 1, got {row.history_days}"
+        # PEG may be suppressed (no LTM from _NoFundamentals), but column is set
+        assert row.peg_suppressed is not None, "peg_suppressed should be set"
+        # signal set (thin history -> insufficient_history or similar)
+        assert row.signal is not None, f"signal should be set, got {row.signal!r}"
+
+    # Second run (same AS_OF): INSERT is a no-op, but UPDATE must still fire.
+    with session_scope() as s:
+        _run(s)
+    with session_scope() as s:
+        rows = s.query(ValuationSnapshot).filter_by(ticker="NVDA").all()
+        assert len(rows) == 1, "same-day re-run must not duplicate the row"
+        row = rows[0]
+        assert row.history_days == 1
+        assert row.peg_suppressed is not None
+        assert row.signal is not None
