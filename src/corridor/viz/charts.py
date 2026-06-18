@@ -13,8 +13,31 @@ never mistakes a handful of days for a deep distribution.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pandas as pd
 import plotly.graph_objects as go
+
+
+# Minimum x-axis window (days). With a single snapshot Plotly zooms to
+# microseconds; this gives a sensible date range that expands naturally as
+# history accumulates.
+_MIN_XRANGE_DAYS = 30
+
+
+def _xaxis_range(df: pd.DataFrame, pad_right_days: int = 3) -> dict:
+    """Return xaxis kwargs that pin a minimum date window."""
+    if df.empty:
+        return {}
+    latest = df.index[-1]
+    earliest = df.index[0]
+    span = (latest - earliest).days
+    if span < _MIN_XRANGE_DAYS:
+        x_start = latest - pd.Timedelta(days=_MIN_XRANGE_DAYS)
+    else:
+        x_start = earliest - pd.Timedelta(days=2)
+    x_end = latest + pd.Timedelta(days=pad_right_days)
+    return {"xaxis": dict(range=[x_start, x_end], type="date")}
 
 
 # ── shared palette ─────────────────────────────────────────────────────────────
@@ -136,6 +159,7 @@ def corridor_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
         yaxis_title="Price (USD)",
         legend=dict(orientation="h", y=-0.15),
         annotations=annotations,
+        **_xaxis_range(df),
     )
     return fig
 
@@ -216,6 +240,7 @@ def true_pe_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
         yaxis_title="Forward P/E (x)",
         legend=dict(orientation="h", y=-0.15),
         annotations=annotations,
+        **_xaxis_range(df),
     )
     return fig
 
@@ -299,5 +324,6 @@ def peg_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
         yaxis_title="Forward PEG",
         legend=dict(orientation="h", y=-0.15),
         annotations=annotations,
+        **_xaxis_range(df),
     )
     return fig

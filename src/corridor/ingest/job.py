@@ -574,8 +574,11 @@ def run_daily(  # noqa: C901 - orchestration; pieces are individually tested
             _insert_or_ignore(session, PriceSnapshot, _price_row(price_rec),
                               ["ticker", "price_date", "source"])
             if result.is_clean and result.valuation is not None:
+                computed = _compute_corridor_peg_signal(
+                    session, result.valuation, fundamentals, cal, as_of, config,
+                )
                 _insert_or_ignore(session, ValuationSnapshot,
-                                  _val_row(result.valuation, config.engine_version),
+                                  _val_row(result.valuation, config.engine_version, computed),
                                   ["ticker", "as_of_date", "engine_version"])
                 _log(session, IngestionLog, ticker, STATUS_OK,
                      result.valuation.construction_method, None, rows_written=1)
@@ -688,8 +691,118 @@ def _price_row(p: PriceRecord) -> dict[str, Any]:
     }
 
 
-def _val_row(v: ValuationInput, engine_version: str) -> dict[str, Any]:
-    return {
+def _compute_corridor_peg_signal(
+    session: Any,
+    v: ValuationInput,
+    fundamentals: list[FundamentalRecord],
+    cal: FiscalCalendar,
+    as_of: date,
+    config: Any,
+) -> dict[str, Any]:
+    """Compute corridor bands, PEG, and signal from accumulated history + today's new point.
+
+    Queries existing certified ValuationSnapshot rows for this ticker (the rows
+    already committed from prior runs), appends today's new point, then runs
+    build_corridor / forward_peg / classify_signal. Returns a dict of the extra
+    columns to merge into _val_row. On any error returns an empty dict so the
+    primary valuation row is never blocked.
+    """
+    from ..db.models import ValuationSnapshot as VS
+    from ..engine.corridor import TruePePoint, build_corridor
+    from ..engine.peg import (forward_peg, ntm_vs_ltm_growth,
+                               quarterly_actuals_from_edgar, trailing_ltm_eps)
+    from ..engine.signals import classify_signal, earnings_trend as _earnings_trend
+
+    try:
+        # --- existing history (prior runs only; today not committed yet) -------
+        hist_rows = (
+            session.query(VS)
+            .filter(
+                VS.ticker == v.ticker,
+                VS.engine_version == config.engine_version,
+                VS.true_pe.isnot(None),
+            )
+            .order_by(VS.as_of_date)
+            .all()
+        )
+        history = [TruePePoint(r.as_of_date, r.true_pe) for r in hist_rows]
+        eps_pts = [(r.as_of_date, r.forward_eps_ntm)
+                   for r in hist_rows if r.forward_eps_ntm is not None]
+
+        # Append today's new point so corridor reflects the full series.
+        history_today = history + [TruePePoint(as_of, v.true_pe)]
+        eps_pts_today = eps_pts + [(as_of, v.forward_eps_sum)]
+
+        # --- corridor params from config (with defaults) ----------------------
+        cor_cfg = (config.valuation or {}).get("corridor", {})
+        min_hist = int(cor_cfg.get("min_history_days", 60))
+        lookback = int(cor_cfg.get("lookback_days", 504)) if cor_cfg.get("lookback_days") else None
+        corridor = build_corridor(
+            v.ticker, as_of, history_today, v.forward_eps_sum, v.price,
+            pctl_low=int(cor_cfg.get("pctl_low", 20)),
+            pctl_high=int(cor_cfg.get("pctl_high", 80)),
+            min_history_days=min_hist,
+            lookback_days=lookback,
+            coverage_score=v.coverage_score,
+        )
+
+        # --- LTM EPS from EDGAR actuals (for PEG) -----------------------------
+        ltm: float | None = None
+        try:
+            q_acts, a_acts = quarterly_actuals_from_edgar(fundamentals, cal)
+            ltm = trailing_ltm_eps(q_acts, a_acts)
+        except Exception:
+            pass
+
+        peg_cfg = config.peg or {}
+        rate, reason = ntm_vs_ltm_growth(v.forward_eps_sum, ltm)
+        peg_res = forward_peg(
+            v.true_pe, v.forward_eps_sum, rate, "ntm_vs_ltm",
+            growth_input=ltm, growth_reason=reason,
+            min_growth_rate=float(peg_cfg.get("min_growth_rate", 0.02)),
+            cheap_threshold=float(peg_cfg.get("cheap_threshold", 1.0)),
+            rich_threshold=float(peg_cfg.get("rich_threshold", 2.0)),
+            coverage_score=v.coverage_score, label=v.ticker,
+        )
+
+        # --- earnings trend + signal ------------------------------------------
+        sig_cfg = (config.valuation or {}).get("signals", {})
+        trend, _ = _earnings_trend(eps_pts_today)
+        sig_res = classify_signal(
+            corridor.pe_percentile, trend,
+            corridor.is_thin, corridor.bands is not None,
+            hard_buy_pctl=int(sig_cfg.get("hard_buy_pctl", 10)),
+            buy_pctl=int(sig_cfg.get("buy_pctl", 20)),
+            trim_pctl=int(sig_cfg.get("trim_pctl", 80)),
+            hard_trim_pctl=int(sig_cfg.get("hard_trim_pctl", 90)),
+        )
+
+        return {
+            "history_days": corridor.history_days,
+            "is_thin_history": corridor.is_thin,
+            "pe_median": corridor.bands.pe_median if corridor.bands else None,
+            "pe_pctl_low": corridor.bands.pe_low if corridor.bands else None,
+            "pe_pctl_high": corridor.bands.pe_high if corridor.bands else None,
+            "corridor_low": corridor.corridor_low_price,
+            "corridor_high": corridor.corridor_high_price,
+            "pe_percentile": corridor.pe_percentile,
+            "forward_peg": peg_res.forward_peg,
+            "growth_rate": peg_res.growth_rate,
+            "growth_basis": peg_res.growth_basis,
+            "peg_suppressed": peg_res.suppressed,
+            "signal": sig_res.signal,
+            "notes": sig_res.rationale,
+        }
+    except Exception:
+        logger.exception("corridor/PEG/signal computation failed for %s — row stored without them",
+                         v.ticker)
+        return {}
+
+
+def _val_row(
+    v: ValuationInput, engine_version: str, computed: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    base = {
         "ticker": v.ticker, "as_of_date": v.as_of_date, "price": v.price,
         "forward_eps_ntm": v.forward_eps_sum, "true_pe": v.true_pe,
         "construction_method": v.construction_method, "coverage_score": v.coverage_score,
@@ -703,3 +816,6 @@ def _val_row(v: ValuationInput, engine_version: str) -> dict[str, Any]:
         "quarterly_xcheck_flag": v.quarterly_xcheck_flag,
         "is_thin_history": True, "engine_version": engine_version,
     }
+    if computed:
+        base.update(computed)
+    return base
